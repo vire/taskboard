@@ -81,8 +81,6 @@ tail -n 20 .taskboard/log.jsonl
 | Variable | Default | Effect |
 |---|---|---|
 | `TASKBOARD_OWNER` | `herdr:$HERDR_PANE_ID` inside Herdr, else `<agent>@<worktree name>` | Owner identity for claims; `--owner` overrides it |
-| `TASKBOARD_TTL_HOURS` | `24` | Claims older than this show `!stale <claim age>` in `list` |
-| `TASKBOARD_QUIET_MIN` | `30` | Doing tasks with no activity for longer show `!quiet` in `list` |
 | `XDG_DATA_HOME` | `~/.local/share` | Backup root |
 
 ## Known limits
@@ -96,12 +94,12 @@ tail -n 20 .taskboard/log.jsonl
 
 ## Design notes
 
-v1 implements the [local agent taskboard plan](docs/plan-v1.md) with these deliberate changes, from a design review:
+v1 departs from its original plan (four board files, a `pending.json` intent record, claim tokens, `renew`, `sweep` and `edit` commands) in these deliberate ways, from a design review:
 
 - **One `board.md` instead of `index.md`, `todo.md`, `inprogress.md` and `done.md`.** Moving a task becomes one atomic file replace, so the `pending.json` intent record and the recovery pass are not needed.
 - **The helper lives in the installed skill only.** No copy goes inside each board, so one version is used everywhere.
 - **Ownership is an owner label, not a claim token.** A token stored in plaintext on the board protects nothing, and agents would have to carry it across turns. v1 tied ownership to the worktree; real use showed agents moving to a fresh worktree after claiming and several read-only agents sharing one checkout, so ownership moved to the owner label.
-- **Expiry is a `!stale` flag in `list`.** There are no `expires_at`, `renew` or `sweep` commands. A takeover is `release --force` with a handoff note.
+- **Expiry is a `!stale` flag in `list`** for claims older than 24 h, and `!quiet` marks doing tasks silent for 30 min. There are no `expires_at`, `renew` or `sweep` commands. A takeover is `release --force` with a handoff note.
 - **No `edit` command that holds the lock.** Hand edits are validated on the next command instead.
 
 ## Development

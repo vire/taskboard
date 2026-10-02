@@ -14,6 +14,7 @@ import fcntl
 import hashlib
 import json
 import os
+import pathlib
 import re
 import subprocess
 import sys
@@ -35,6 +36,8 @@ Shared by every worktree of this clone. Change it through the helper
 SECTIONS = ("Plans", "Todo", "In progress", "Done")
 KEEP_BACKUPS = 30
 LOCK_WAIT_S = 10.0
+TTL_HOURS = 24  # claims older than this show !stale in list
+QUIET_MIN = 30  # doing tasks silent for longer show !quiet in list
 HEAD = re.compile(r"^### ((?:TB|P)-\d+) - (\S.*)$")
 FIELD = re.compile(r"^- ([a-z_]+):(.*)$")
 EXIT_ERROR, EXIT_NOTHING, EXIT_BUSY = 1, 3, 75
@@ -130,9 +133,7 @@ class Item:
 
     def add_entry(self, sub: str, text: str, who: str) -> None:
         """Append a timestamped bullet under `#### sub`, creating the subsection if needed."""
-        first, *rest = [line.rstrip() for line in text.strip().splitlines()] or [""]
-        if not first:
-            raise BoardError(f"empty {sub.lower()} text")
+        first, *rest = text_lines(text)
         new = [f"- {stamp()} {who}: {first}"] + [f"  {line}".rstrip() for line in rest]
         head = f"#### {sub}"
         if head not in self.lines:
@@ -153,7 +154,6 @@ class Board:
 
     def __init__(self, text: str):
         self.preamble: list[str] = []
-        self.order: list[str] = []
         self.intro: dict[str, list[str]] = {}
         self.items: dict[str, list[Item]] = {}
         target: list[str] = self.preamble
@@ -165,7 +165,6 @@ class Board:
                     raise BoardError(f"board.md:{n}: unknown section '## {current}' (expected {', '.join(SECTIONS)})")
                 if current in self.items:
                     raise BoardError(f"board.md:{n}: duplicate section '## {current}'")
-                self.order.append(current)
                 self.items[current], self.intro[current] = [], []
                 target = self.intro[current]
             elif line.startswith("### "):
@@ -187,7 +186,7 @@ class Board:
 
     def render(self) -> str:
         blocks = ["\n".join(self.preamble)] if self.preamble else []
-        for name in self.order:
+        for name in SECTIONS:
             blocks.append(f"## {name}")
             if self.intro[name]:
                 blocks.append("\n".join(self.intro[name]))
@@ -258,19 +257,18 @@ class Board:
         nums = [int(i.id.split("-")[1]) for items in self.items.values() for i in items if i.id.startswith(prefix)]
         return f"{prefix}{max(nums, default=0) + 1:0{width}d}"
 
-    def ready(self, it: Item) -> bool:
+    def waiting(self, it: Item) -> list[str]:
         done = {i.id for i in self.items["Done"]}
-        return all(d in done for d in it.deps)
+        return [d for d in it.deps if d not in done]
 
 
 # ---------------------------------------------------------------- repo, storage, locking
 
 
 class Repo:
-    def __init__(self):
+    def __init__(self, owner: str | None = None):
         common, self.top, self.exclude = git(
             "rev-parse", "--path-format=absolute", "--git-common-dir", "--show-toplevel", "--git-path", "info/exclude")
-        self.common = common
         self.dir = os.path.join(common, "taskboard")
         self.board = os.path.join(self.dir, "board.md")
         self.log = os.path.join(self.dir, "log.jsonl")
@@ -279,6 +277,12 @@ class Repo:
         slug = f"{os.path.basename(repo_root)}-{hashlib.sha1(common.encode()).hexdigest()[:8]}"
         data = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
         self.backups = os.path.join(data, "taskboard", slug)
+        agent = "claude" if os.environ.get("CLAUDECODE") else (
+            "codex" if any(k.startswith("CODEX") for k in os.environ) else os.environ.get("USER", "agent"))
+        herdr = os.environ.get("HERDR_PANE_ID") if os.environ.get("HERDR_ENV") == "1" else None
+        # ponytail: worktrees sharing a basename share the default owner; set TASKBOARD_OWNER if that bites
+        self.owner = (owner or os.environ.get("TASKBOARD_OWNER") or (f"herdr:{herdr}" if herdr else None)
+                      or f"{agent}@{os.path.basename(self.top)}")
 
     def ensure_init(self) -> None:
         """Idempotent: board dir and file, git exclude rule, .taskboard link in every worktree, tb link."""
@@ -299,8 +303,7 @@ class Repo:
         link(os.path.join(self.dir, "tb"), os.path.realpath(__file__))
 
     def read(self) -> str:
-        with open(self.board) as f:
-            return f.read()
+        return pathlib.Path(self.board).read_text()
 
     @contextlib.contextmanager
     def locked(self):
@@ -331,9 +334,7 @@ class Repo:
             return []
         return sorted((f for f in os.listdir(self.backups) if f.startswith("board-")), reverse=True)
 
-    def commit(self, old: str, board: Board, event: dict) -> None:
-        board.validate()
-        new = board.render()
+    def commit(self, old: str, new: str, event: dict) -> None:
         if new == old:
             return
         self.snapshot(old)
@@ -342,7 +343,27 @@ class Repo:
 
     def append_log(self, event: dict) -> None:
         with open(self.log, "a") as f:
-            f.write(json.dumps({"ts": stamp(), **event}) + "\n")
+            f.write(json.dumps({"ts": stamp(), "owner": self.owner, "worktree": self.top, **event}) + "\n")
+
+    def mutate(self, cmd: str, fn) -> str:
+        """Lock, reread, apply fn(board) -> (output, event), validate, snapshot, write, log."""
+        with self.locked():
+            old = self.read()
+            board = Board(old)
+            out, event = fn(board)
+            board.validate()
+            self.commit(old, board.render(), {"cmd": cmd, **event})
+        return out
+
+    def own(self, it: Item, force: bool) -> None:
+        """The owner decides, not the worktree; the owner acting from another worktree moves the task there."""
+        if it.get("owner") != self.owner and not force:
+            raise BoardError(f"{it.id} is held by {it.get('owner')} (worktree {it.get('worktree')}); you are {self.owner}. "
+                             "If you did not claim it yourself, stop and ask the user (--force needs their go-ahead). "
+                             f"If you claimed it and only changed worktree, rerun with --owner {it.get('owner')} "
+                             "placed before the command")
+        if it.get("owner") == self.owner:
+            it.set("worktree", self.top)
 
 
 def link(path: str, target: str) -> None:
@@ -368,37 +389,6 @@ def write_atomic(path: str, text: str) -> None:
 # ---------------------------------------------------------------- commands
 
 
-class Ctx:
-    def __init__(self, repo: Repo, owner: str | None):
-        self.repo = repo
-        self.top = repo.top
-        agent = "claude" if os.environ.get("CLAUDECODE") else (
-            "codex" if any(k.startswith("CODEX") for k in os.environ) else os.environ.get("USER", "agent"))
-        herdr = os.environ.get("HERDR_PANE_ID") if os.environ.get("HERDR_ENV") == "1" else None
-        # ponytail: worktrees sharing a basename share the default owner; set TASKBOARD_OWNER if that bites
-        self.owner = (owner or os.environ.get("TASKBOARD_OWNER") or (f"herdr:{herdr}" if herdr else None)
-                      or f"{agent}@{os.path.basename(self.top)}")
-
-    def mutate(self, cmd: str, fn):
-        """Lock, reread, apply fn(board) -> (output, event), validate, snapshot, write, log."""
-        with self.repo.locked():
-            old = self.repo.read()
-            board = Board(old)
-            out, event = fn(board)
-            self.repo.commit(old, board, {"owner": self.owner, "worktree": self.top, "cmd": cmd, **event})
-        return out
-
-    def own(self, it: Item, force: bool) -> None:
-        """The owner decides, not the worktree; the owner acting from another worktree moves the task there."""
-        if it.get("owner") != self.owner and not force:
-            raise BoardError(f"{it.id} is held by {it.get('owner')} (worktree {it.get('worktree')}); you are {self.owner}. "
-                             "If you did not claim it yourself, stop and ask the user (--force needs their go-ahead). "
-                             f"If you claimed it and only changed worktree, rerun with --owner {it.get('owner')} "
-                             "placed before the command")
-        if it.get("owner") == self.owner:
-            it.set("worktree", self.top)
-
-
 def age(ts: str) -> tuple[str, float]:
     try:
         hours = (utcnow() - dt.datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc)).total_seconds() / 3600
@@ -408,17 +398,16 @@ def age(ts: str) -> tuple[str, float]:
 
 
 def row(board: Board, section: str, it: Item) -> str:
-    ttl = float(os.environ.get("TASKBOARD_TTL_HOURS", "24"))
     extra = ""
     if section == "Todo":
-        waiting = [d for d in it.deps if d not in {i.id for i in board.items["Done"]}]
+        waiting = board.waiting(it)
         status, extra = ("waiting", f"needs {','.join(waiting)}") if waiting else ("ready", "")
     elif section == "In progress":
         claimed, hours = age(it.get("claimed_at"))
         label, idle = age(it.get("updated_at") or it.get("claimed_at"))
         status = "blocked" if it.blocked else "doing"
-        quiet = not it.blocked and idle * 60 > float(os.environ.get("TASKBOARD_QUIET_MIN", "30"))
-        extra = f"{it.get('owner')} {label}" + (f" !stale {claimed}" if hours > ttl else "") + (" !quiet" if quiet else "")
+        quiet = not it.blocked and idle * 60 > QUIET_MIN
+        extra = f"{it.get('owner')} {label}" + (f" !stale {claimed}" if hours > TTL_HOURS else "") + (" !quiet" if quiet else "")
         if it.blocked:
             extra += f" ({it.blocked})"
     else:
@@ -426,15 +415,13 @@ def row(board: Board, section: str, it: Item) -> str:
     return f"{it.id:<8} {status:<8} {it.get('plan'):<6} {it.title}" + (f"  [{extra}]" if extra else "")
 
 
-def cmd_init(args, ctx: Ctx) -> int:
-    r = ctx.repo
-    print(f"board:   {r.board}\nlink:    {os.path.join(r.top, '.taskboard')}\nlog:     {r.log}\n"
-          f"backups: {r.backups}\nrun:     python3 .taskboard/tb --help")
-    return 0
+def cmd_init(args, r: Repo) -> str:
+    return (f"board:   {r.board}\nlink:    {os.path.join(r.top, '.taskboard')}\nlog:     {r.log}\n"
+            f"backups: {r.backups}\nrun:     python3 .taskboard/tb --help")
 
 
-def cmd_list(args, ctx: Ctx) -> int:
-    board = Board(ctx.repo.read())
+def cmd_list(args, r: Repo) -> str:
+    board = Board(r.read())
     out = []
     if not args.plan:
         for p in board.items["Plans"]:
@@ -446,27 +433,24 @@ def cmd_list(args, ctx: Ctx) -> int:
     for section, it in board.tasks():
         if (args.all or section != "Done") and args.plan in (None, it.get("plan")):
             out.append(row(board, section, it))
-    print("\n".join(out) if out else "board is empty; create a plan with: plan \"Title\" --body \"...\"")
-    return 0
+    return "\n".join(out) if out else "board is empty; create a plan with: plan \"Title\" --body \"...\""
 
 
-def cmd_show(args, ctx: Ctx) -> int:
-    section, it = Board(ctx.repo.read()).find(args.id)
-    print(f"[{section}]\n" + "\n".join(it.lines))
-    return 0
+def cmd_show(args, r: Repo) -> str:
+    section, it = Board(r.read()).find(args.id)
+    return f"[{section}]\n" + "\n".join(it.lines)
 
 
-def cmd_plan(args, ctx: Ctx) -> int:
+def cmd_plan(args, r: Repo) -> str:
     def fn(b: Board):
         pid = b.next_id("P-", 3)
         lines = [f"### {pid} - {one_line(args.title)}"] + (["", *text_lines(args.body)] if args.body else [])
         b.items["Plans"].append(Item(lines))
         return pid, {"id": pid, "to": "Plans"}
-    print(ctx.mutate("plan", fn))
-    return 0
+    return r.mutate("plan", fn)
 
 
-def cmd_add(args, ctx: Ctx) -> int:
+def cmd_add(args, r: Repo) -> str:
     def fn(b: Board):
         if b.find(args.plan)[0] != "Plans":
             raise BoardError(f"{args.plan} is not a plan")
@@ -479,34 +463,32 @@ def cmd_add(args, ctx: Ctx) -> int:
         lines += [f"- {one_line(c)}" for c in args.done_when]
         b.items["Todo"].append(Item(lines))
         return tid, {"id": tid, "to": "Todo"}
-    print(ctx.mutate("add", fn))
-    return 0
+    return r.mutate("add", fn)
 
 
-def cmd_claim(args, ctx: Ctx) -> int:
+def cmd_claim(args, r: Repo) -> str:
     def fn(b: Board):
-        held = [i for i in b.items["In progress"] if i.get("owner") == ctx.owner and not i.blocked]
+        held = [i for i in b.items["In progress"] if i.get("owner") == r.owner and not i.blocked]
         if held:
-            raise BoardError(f"{ctx.owner} already works on {held[0].id}; complete, block or release it first "
+            raise BoardError(f"{r.owner} already works on {held[0].id}; complete, block or release it first "
                              "(one unblocked task per owner, use another --owner for parallel work)")
         if args.id:
             it = b.task_in(args.id, "Todo")
-            if not b.ready(it):
-                raise NothingEligible(f"{it.id} still waits on {', '.join(d for d in it.deps if b.find(d)[0] != 'Done')}")
+            if b.waiting(it):
+                raise NothingEligible(f"{it.id} still waits on {', '.join(b.waiting(it))}")
         else:
             todo = [i for i in b.items["Todo"] if args.plan in (None, i.get("plan"))]
-            it = next((i for i in todo if b.ready(i)), None)
+            it = next((i for i in todo if not b.waiting(i)), None)
             if it is None:
                 raise NothingEligible(why_nothing(b, args.plan))
-        it.set("owner", ctx.owner)
-        it.set("worktree", ctx.top)
+        it.set("owner", r.owner)
+        it.set("worktree", r.top)
         it.set("claimed_at", stamp())
         it.set("updated_at", stamp())
         it.set("blocked", "none")
         b.move(it, "Todo", "In progress")
         return "\n".join(it.lines), {"id": it.id, "from": "Todo", "to": "In progress"}
-    print(ctx.mutate("claim", fn))
-    return 0
+    return r.mutate("claim", fn)
 
 
 def why_nothing(b: Board, plan: str | None) -> str:
@@ -517,93 +499,81 @@ def why_nothing(b: Board, plan: str | None) -> str:
     return f"no eligible task in {scope}; remaining:\n" + "\n".join(rows)
 
 
-def cmd_progress(args, ctx: Ctx) -> int:
+def cmd_progress(args, r: Repo) -> str:
     if not (args.note or args.blocked or args.handoff):
         raise BoardError("give --note, --blocked or --handoff")
 
     def fn(b: Board):
         it = b.task_in(args.id, "In progress")
-        ctx.own(it, args.force)
+        r.own(it, args.force)
         if args.blocked:
             it.set("blocked", one_line(args.blocked))
-            it.add_entry("Progress", f"blocked: {args.blocked}" if args.blocked != "none" else "unblocked", ctx.owner)
+            it.add_entry("Progress", f"blocked: {args.blocked}" if args.blocked != "none" else "unblocked", r.owner)
         if args.note:
-            it.add_entry("Progress", args.note, ctx.owner)
+            it.add_entry("Progress", args.note, r.owner)
         if args.handoff:
-            it.add_entry("Handoff", args.handoff, ctx.owner)
+            it.add_entry("Handoff", args.handoff, r.owner)
         it.set("updated_at", stamp())
         return f"{it.id} updated", {"id": it.id, "note": args.blocked or args.note or args.handoff}
-    print(ctx.mutate("progress", fn))
-    return 0
+    return r.mutate("progress", fn)
 
 
-def cmd_complete(args, ctx: Ctx) -> int:
+def cmd_complete(args, r: Repo) -> str:
     def fn(b: Board):
         it = b.task_in(args.id, "In progress")
-        ctx.own(it, args.force)
+        r.own(it, args.force)
         for e in args.evidence:
-            it.add_entry("Evidence", e, ctx.owner)
+            it.add_entry("Evidence", e, r.owner)
         it.drop("blocked")
         it.set("completed_at", stamp())
         it.set("updated_at", stamp())
         b.move(it, "In progress", "Done")
         return f"{it.id} done. Next: claim --plan {it.get('plan')}", {
             "id": it.id, "from": "In progress", "to": "Done", "note": "; ".join(args.evidence)}
-    print(ctx.mutate("complete", fn))
-    return 0
+    return r.mutate("complete", fn)
 
 
-def cmd_release(args, ctx: Ctx) -> int:
+def cmd_release(args, r: Repo) -> str:
     def fn(b: Board):
         it = b.task_in(args.id, "In progress")
-        ctx.own(it, args.force)
+        r.own(it, args.force)
         who = it.get("owner")
-        note = args.handoff if who == ctx.owner else f"(released from {who}) {args.handoff}"
-        it.add_entry("Handoff", note, ctx.owner)
+        note = args.handoff if who == r.owner else f"(released from {who}) {args.handoff}"
+        it.add_entry("Handoff", note, r.owner)
         it.drop("owner", "worktree", "claimed_at", "blocked")
         it.set("updated_at", stamp())
         b.move(it, "In progress", "Todo", top=True)
         return f"{it.id} back on top of Todo", {"id": it.id, "from": "In progress", "to": "Todo", "note": note}
-    print(ctx.mutate("release", fn))
-    return 0
+    return r.mutate("release", fn)
 
 
-def cmd_close(args, ctx: Ctx) -> int:
+def cmd_close(args, r: Repo) -> str:
     def fn(b: Board):
         src, it = b.find(args.id)
         if src not in ("Todo", "In progress"):
             raise BoardError(f"{it.id} is in '{src}', not 'Todo' or 'In progress'")
         if src == "In progress":
-            ctx.own(it, args.force)
+            r.own(it, args.force)
         note = f"closed: {args.reason}"
-        it.add_entry("Evidence", note, ctx.owner)
+        it.add_entry("Evidence", note, r.owner)
         it.drop("owner", "worktree", "claimed_at", "blocked")
         it.set("closed_at", stamp())
         it.set("updated_at", stamp())
         b.move(it, src, "Done")
         return f"{it.id} closed", {"id": it.id, "from": src, "to": "Done", "note": note}
-    print(ctx.mutate("close", fn))
-    return 0
+    return r.mutate("close", fn)
 
 
-def cmd_restore(args, ctx: Ctx) -> int:
-    r = ctx.repo
+def cmd_restore(args, r: Repo) -> str:
     if not args.backup:
         names = r.list_backups()
-        print(f"backups in {r.backups} (newest first):\n" + "\n".join(names) if names else f"no backups in {r.backups}")
-        return 0
+        return f"backups in {r.backups} (newest first):\n" + "\n".join(names) if names else f"no backups in {r.backups}"
     path = args.backup if os.path.isfile(args.backup) else os.path.join(r.backups, args.backup)
-    with open(path) as f:
-        text = f.read()
+    text = pathlib.Path(path).read_text()
     Board(text)  # refuse to restore something invalid
     with r.locked():
-        old = r.read()
-        if old != text:
-            r.snapshot(old)
-            write_atomic(r.board, text)
-            r.append_log({"owner": ctx.owner, "worktree": ctx.top, "cmd": "restore", "note": path})
-    print(f"restored {path} (previous board saved as a new backup)")
-    return 0
+        r.commit(r.read(), text, {"cmd": "restore", "note": path})
+    return f"restored {path} (previous board saved as a new backup)"
 
 
 def parser() -> argparse.ArgumentParser:
@@ -660,12 +630,12 @@ def parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
-    ctx = None
+    r = None
     try:
-        repo = Repo()
-        repo.ensure_init()
-        ctx = Ctx(repo, args.owner)
-        return args.fn(args, ctx)
+        r = Repo(args.owner)
+        r.ensure_init()
+        print(args.fn(args, r))
+        return 0
     except NothingEligible as e:
         print(e)
         return EXIT_NOTHING
@@ -674,10 +644,10 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_BUSY
     except (BoardError, OSError) as e:
         print(f"taskboard: {e}", file=sys.stderr)
-        if ctx and args.cmd not in ("list", "show", "init"):
+        if r and args.cmd not in ("list", "show", "init"):
             with contextlib.suppress(OSError):  # a refusal is history too, but must not change the outcome
-                ctx.repo.append_log({"owner": ctx.owner, "worktree": ctx.top, "cmd": args.cmd, "exit": EXIT_ERROR,
-                                     "reason": str(e), **({"id": args.id} if getattr(args, "id", None) else {})})
+                r.append_log({"cmd": args.cmd, "exit": EXIT_ERROR, "reason": str(e),
+                              **({"id": args.id} if getattr(args, "id", None) else {})})
         return EXIT_ERROR
 
 
