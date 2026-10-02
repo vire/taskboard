@@ -38,6 +38,7 @@ LOCK_WAIT_S = 10.0
 HEAD = re.compile(r"^### ((?:TB|P)-\d+) - (\S.*)$")
 FIELD = re.compile(r"^- ([a-z_]+):(.*)$")
 EXIT_ERROR, EXIT_NOTHING, EXIT_BUSY = 1, 3, 75
+READ_ONLY = ("list", "show", "init")
 
 
 class BoardError(Exception):
@@ -382,6 +383,13 @@ class Ctx:
             self.repo.commit(old, board, {"owner": self.owner, "worktree": self.top, "cmd": cmd, **event})
         return out
 
+    def log_refusal(self, cmd: str, id: str | None, reason: str) -> None:
+        """Best effort: a refusal is history too, but must never change the outcome of the command."""
+        with contextlib.suppress(Exception), open(self.repo.log, "a") as f:
+            event = {"ts": stamp(), "owner": self.owner, "worktree": self.top, "cmd": cmd, "exit": EXIT_ERROR,
+                     "reason": reason, **({"id": id} if id else {})}
+            f.write(json.dumps(event) + "\n")
+
     def own(self, it: Item, force: bool) -> None:
         if it.get("worktree") != self.top and not force:
             raise BoardError(f"{it.id} is held by {it.get('owner')} in {it.get('worktree')}, not this worktree "
@@ -626,10 +634,12 @@ def parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
+    ctx = None
     try:
         repo = Repo()
         repo.ensure_init()
-        return args.fn(args, Ctx(repo, args.owner))
+        ctx = Ctx(repo, args.owner)
+        return args.fn(args, ctx)
     except NothingEligible as e:
         print(e)
         return EXIT_NOTHING
@@ -638,6 +648,8 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_BUSY
     except (BoardError, OSError) as e:
         print(f"taskboard: {e}", file=sys.stderr)
+        if ctx and isinstance(e, BoardError) and args.cmd not in READ_ONLY:
+            ctx.log_refusal(args.cmd, getattr(args, "id", None), str(e))
         return EXIT_ERROR
 
 

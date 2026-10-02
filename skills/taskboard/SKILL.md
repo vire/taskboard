@@ -29,6 +29,8 @@ Run it from inside your worktree. The first call connects the worktree, and ever
 
 Exit codes: `0` ok, `1` error (message says why, with `board.md:LINE` for a malformed board), `3` nothing eligible to claim (the output lists what remains and why), `75` board busy (wait a few seconds and retry).
 
+A refused state-changing command (exit `1`) also leaves a line with its reason in `log.jsonl`.
+
 ## Working through a plan
 
 1. If asked to prepare the work: `plan`, then `add` small tasks in the order they should be done. Each needs one outcome sentence and checkable `--done-when` criteria. Use `--depends-on` only for real prerequisites in the same plan.
