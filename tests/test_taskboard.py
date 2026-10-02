@@ -3,6 +3,7 @@ import contextlib
 import importlib.util
 import io
 import os
+import pathlib
 import subprocess
 import sys
 import tempfile
@@ -163,6 +164,23 @@ class TaskboardTest(unittest.TestCase):
         self.ok(self.main, "restore", backups[0])  # newest: plan + first task
         self.ok(self.main, "add", "Task 1", "--plan", "P-001", "--outcome", "It works.", "--done-when", "checks pass")
         self.assertEqual(self.board_text(), good)
+
+    def test_refused_mutation_is_logged_but_reads_and_exit_3_are_not(self):
+        plan, (a, *_) = self.seed(1)
+        self.ok(self.wts[0], "claim", a)
+        log = os.path.join(self.main, ".taskboard", "log.jsonl")
+        lines = lambda: pathlib.Path(log).read_text().splitlines()
+        before = len(lines())
+        code, out = self.tb(self.wts[1], "complete", a, "--evidence", "x")
+        self.assertEqual(code, 1)
+        self.assertIn("not this worktree", out)
+        self.assertEqual(len(lines()), before + 1)
+        entry = tb.json.loads(lines()[-1])
+        self.assertEqual((entry["cmd"], entry["exit"], entry["id"], entry["worktree"]), ("complete", 1, a, self.wts[1]))
+        self.assertIn("not this worktree", entry["reason"])
+        self.assertEqual(self.tb(self.main, "show", "TB-9999")[0], 1)
+        self.assertEqual(self.tb(self.wts[1], "claim", "--plan", plan)[0], 3)
+        self.assertEqual(len(lines()), before + 1)
 
     def test_concurrent_claims_each_take_a_distinct_task(self):
         plan, ids = self.seed(8)
