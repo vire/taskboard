@@ -9,6 +9,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 SCRIPT = os.path.join(os.path.dirname(__file__), "..", "skills", "taskboard", "taskboard.py")
 spec = importlib.util.spec_from_file_location("taskboard", SCRIPT)
@@ -27,8 +28,6 @@ class TaskboardTest(unittest.TestCase):
         self.env = {"XDG_DATA_HOME": os.path.join(root, "xdg"), "TASKBOARD_OWNER": "", "HERDR_ENV": "", "HERDR_PANE_ID": ""}
         self._old_env = {k: os.environ.get(k) for k in self.env}
         os.environ.update(self.env)
-        for k in ("TASKBOARD_QUIET_MIN", "TASKBOARD_TTL_HOURS"):  # a developer's own settings must not leak in
-            self._old_env[k] = os.environ.pop(k, None)
         self.main = os.path.join(root, "repo")
         os.makedirs(self.main)
         sh(self.main, "git", "init", "-q")
@@ -165,6 +164,7 @@ class TaskboardTest(unittest.TestCase):
         plan, (a, *_) = self.seed()
         self.ok(self.wts[0], "claim")
         self.ok(self.wts[0], "progress", a, "--note", "line one\nline two", "--handoff", "see commit")
+        self.assertEqual(self.tb(self.wts[0], "progress", a, "--note", "ok\n## not a section")[0], 1)
         text = self.board_text()
         self.assertEqual(tb.Board(text).render(), text)
         with open(os.path.join(self.main, ".taskboard", "board.md"), "a") as f:
@@ -223,13 +223,10 @@ class TaskboardTest(unittest.TestCase):
         self.ok(self.wts[0], "claim", a)
         self.ok(self.wts[1], "claim", b)
         self.assertNotIn("!quiet", self.ok(self.main, "list"))
-        os.environ["TASKBOARD_QUIET_MIN"] = "0"
-        try:
+        with mock.patch.object(tb, "QUIET_MIN", 0):
             time.sleep(1.1)
             self.ok(self.wts[1], "progress", b, "--blocked", "waiting")
             rows = {l.split()[0]: l for l in self.ok(self.main, "list").splitlines()}
-        finally:
-            del os.environ["TASKBOARD_QUIET_MIN"]
         self.assertIn("!quiet", rows[a])
         self.assertNotIn("!quiet", rows[b])
 
