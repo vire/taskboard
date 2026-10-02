@@ -149,24 +149,12 @@ class TaskboardTest(unittest.TestCase):
         shown = self.ok(self.main, "show", a)
         self.assertIn("[Done]", shown)
         self.assertIn(f"- worktree: {self.wts[1]}", shown)
-        with open(os.path.join(self.main, ".taskboard", "log.jsonl")) as f:
-            self.assertIn(f'"moved_from": "{self.wts[0]}"', f.read())
 
     def test_two_owners_can_claim_in_one_worktree(self):
         plan, (a, b, _) = self.seed()
         self.ok(self.wts[0], "--owner", "x", "claim")
         self.assertEqual(self.tb(self.wts[0], "--owner", "x", "claim")[0], 1)
         self.assertIn(b, self.ok(self.wts[0], "--owner", "y", "claim"))
-
-    def test_default_identity_stays_bound_to_its_worktree(self):
-        plan, (a, *_) = self.seed()
-        root = os.path.dirname(self.main)
-        twins = [os.path.join(root, d, "same") for d in "xy"]
-        for n, wt in enumerate(twins):
-            sh(self.main, "git", "worktree", "add", "-q", "-b", f"twin{n}", wt)
-        self.ok(twins[0], "claim", a)
-        self.assertEqual(self.tb(twins[1], "complete", a, "--evidence", "x")[0], 1)  # same basename, other worktree
-        self.ok(twins[1], "claim")
 
     def test_herdr_pane_is_the_default_owner(self):
         self.seed(1)

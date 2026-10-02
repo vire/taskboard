@@ -17,7 +17,7 @@ Run it from inside your worktree. The first call connects the worktree, and ever
 
 | Command | Use |
 |---|---|
-| `list [--plan P-001] [--all]` | One line per plan and open task: `ready`, `waiting [needs ...]`, `doing [owner age]`, `blocked`. `age` is time since last activity; `!quiet` marks a doing task silent for over `TASKBOARD_QUIET_MIN` minutes (default 30); `!stale 26h` shows the claim age. Plan lines count done and closed separately. Done and closed tasks only with `--all` |
+| `list [--plan P-001] [--all]` | One line per plan and open task: `ready`, `waiting [needs ...]`, `doing [owner age]`, `blocked`. `age` is time since last activity; `!quiet` marks a doing task silent for over `TASKBOARD_QUIET_MIN` minutes (default 30); `!stale 26h` shows the claim age. Done and closed tasks only with `--all` |
 | `show ID` | One task or plan in full |
 | `plan "Title" --body "scope"` | Create a plan; prints `P-001` |
 | `add "Title" --plan P-001 --outcome "..." --done-when "..." [--done-when ...] [--depends-on TB-0001,TB-0002]` | Add a task at the end of Todo; prints `TB-0001` |
@@ -29,8 +29,6 @@ Run it from inside your worktree. The first call connects the worktree, and ever
 | `restore [BACKUP]` | List backups or restore one (user-directed) |
 
 Exit codes: `0` ok, `1` error (message says why, with `board.md:LINE` for a malformed board), `3` nothing eligible to claim (the output lists what remains and why), `75` board busy (wait a few seconds and retry).
-
-A refused state-changing command (exit `1`) also leaves a line with its reason in `log.jsonl`.
 
 ## Working through a plan
 
@@ -47,10 +45,9 @@ One line is enough: `Use the taskboard skill with --owner worker-2 and claim TB-
 ## Rules
 
 - Identity is the owner label: `--owner`, else `$TASKBOARD_OWNER`, else `herdr:$HERDR_PANE_ID` inside Herdr, else `<agent>@<worktree>`. The helper allows one unblocked claim per owner, and only the owner may progress, complete, release or close a task. Parallel work needs separate owners; work that changes files also needs separate worktrees.
-- The default `<agent>@<worktree>` identity is bound to its worktree. If you claimed a task and then moved to another worktree (or your Herdr pane moved and got a new id), pass `--owner <owner shown on the task>` on every later command; the task then follows you. Never pass another agent's owner: that needs the user's go-ahead, like `--force`.
+- If you claimed a task and then moved to another worktree (or your Herdr pane moved and got a new id), pass `--owner <owner shown on the task>` on every later command; the task then follows you. Never pass another agent's owner: that needs the user's go-ahead, like `--force`.
 - Stay inside the assigned plan. Add subtasks the plan needs. Put broader discoveries in a plan titled `Proposals` (create it once) and do not claim them.
 - `close` only for a Proposals entry once the user has turned it into tickets, or a task the user says is superseded or dropped. Never to skip work.
 - `--force` (acting on another owner's task) and `restore` only when the user tells you to.
-- `!quiet` in `list` means no progress for a while; the orchestrator may ask that agent for status.
 - `!stale` in `list` means a claim is older than `TASKBOARD_TTL_HOURS` (default 24). It is for the user to decide. Do not take the task over on your own.
 - On a malformed-board error, tell the user the line. Do not repair the file by hand unless asked.

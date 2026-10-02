@@ -38,7 +38,6 @@ LOCK_WAIT_S = 10.0
 HEAD = re.compile(r"^### ((?:TB|P)-\d+) - (\S.*)$")
 FIELD = re.compile(r"^- ([a-z_]+):(.*)$")
 EXIT_ERROR, EXIT_NOTHING, EXIT_BUSY = 1, 3, 75
-READ_ONLY = ("list", "show", "init")
 
 
 class BoardError(Exception):
@@ -339,6 +338,9 @@ class Repo:
             return
         self.snapshot(old)
         write_atomic(self.board, new)
+        self.append_log(event)
+
+    def append_log(self, event: dict) -> None:
         with open(self.log, "a") as f:
             f.write(json.dumps({"ts": stamp(), **event}) + "\n")
 
@@ -373,9 +375,9 @@ class Ctx:
         agent = "claude" if os.environ.get("CLAUDECODE") else (
             "codex" if any(k.startswith("CODEX") for k in os.environ) else os.environ.get("USER", "agent"))
         herdr = os.environ.get("HERDR_PANE_ID") if os.environ.get("HERDR_ENV") == "1" else None
-        explicit = owner or os.environ.get("TASKBOARD_OWNER") or (f"herdr:{herdr}" if herdr else None)
-        self.owner = explicit or f"{agent}@{os.path.basename(self.top)}"
-        self.portable = bool(explicit)  # the default identity is bound to its worktree (basenames can repeat)
+        # ponytail: worktrees sharing a basename share the default owner; set TASKBOARD_OWNER if that bites
+        self.owner = (owner or os.environ.get("TASKBOARD_OWNER") or (f"herdr:{herdr}" if herdr else None)
+                      or f"{agent}@{os.path.basename(self.top)}")
 
     def mutate(self, cmd: str, fn):
         """Lock, reread, apply fn(board) -> (output, event), validate, snapshot, write, log."""
@@ -386,26 +388,15 @@ class Ctx:
             self.repo.commit(old, board, {"owner": self.owner, "worktree": self.top, "cmd": cmd, **event})
         return out
 
-    def log_refusal(self, cmd: str, id: str | None, reason: str) -> None:
-        """Best effort: a refusal is history too, but must never change the outcome of the command."""
-        with contextlib.suppress(Exception), open(self.repo.log, "a") as f:
-            event = {"ts": stamp(), "owner": self.owner, "worktree": self.top, "cmd": cmd, "exit": EXIT_ERROR,
-                     "reason": reason, **({"id": id} if id else {})}
-            f.write(json.dumps(event) + "\n")
-
-    def own(self, it: Item, force: bool) -> dict:
-        """The owner decides; an explicit owner in another worktree moves the task there."""
-        mine = it.get("owner") == self.owner and (self.portable or it.get("worktree") == self.top)
-        if not mine and not force:
+    def own(self, it: Item, force: bool) -> None:
+        """The owner decides, not the worktree; the owner acting from another worktree moves the task there."""
+        if it.get("owner") != self.owner and not force:
             raise BoardError(f"{it.id} is held by {it.get('owner')} (worktree {it.get('worktree')}); you are {self.owner}. "
                              "If you did not claim it yourself, stop and ask the user (--force needs their go-ahead). "
                              f"If you claimed it and only changed worktree, rerun with --owner {it.get('owner')} "
                              "placed before the command")
-        old = it.get("worktree")
-        if not mine or old == self.top:
-            return {}
-        it.set("worktree", self.top)
-        return {"moved_from": old}
+        if it.get("owner") == self.owner:
+            it.set("worktree", self.top)
 
 
 def age(ts: str) -> tuple[str, float]:
@@ -448,9 +439,8 @@ def cmd_list(args, ctx: Ctx) -> int:
     if not args.plan:
         for p in board.items["Plans"]:
             counts = {s: sum(1 for i in board.items[s] if i.get("plan") == p.id) for s in SECTIONS[1:]}
-            closed = sum(1 for i in board.items["Done"] if i.get("plan") == p.id and i.get("closed_at"))
             out.append(f"{p.id:<8} plan     {counts['Todo']} todo, {counts['In progress']} in progress, "
-                       f"{counts['Done'] - closed} done" + (f", {closed} closed" if closed else "") + f"  {p.title}")
+                       f"{counts['Done']} done  {p.title}")
     elif args.plan not in {p.id for p in board.items["Plans"]}:
         raise BoardError(f"no such plan {args.plan}")
     for section, it in board.tasks():
@@ -495,8 +485,7 @@ def cmd_add(args, ctx: Ctx) -> int:
 
 def cmd_claim(args, ctx: Ctx) -> int:
     def fn(b: Board):
-        held = [i for i in b.items["In progress"] if i.get("owner") == ctx.owner and not i.blocked
-                and (ctx.portable or i.get("worktree") == ctx.top)]
+        held = [i for i in b.items["In progress"] if i.get("owner") == ctx.owner and not i.blocked]
         if held:
             raise BoardError(f"{ctx.owner} already works on {held[0].id}; complete, block or release it first "
                              "(one unblocked task per owner, use another --owner for parallel work)")
@@ -534,7 +523,7 @@ def cmd_progress(args, ctx: Ctx) -> int:
 
     def fn(b: Board):
         it = b.task_in(args.id, "In progress")
-        moved = ctx.own(it, args.force)
+        ctx.own(it, args.force)
         if args.blocked:
             it.set("blocked", one_line(args.blocked))
             it.add_entry("Progress", f"blocked: {args.blocked}" if args.blocked != "none" else "unblocked", ctx.owner)
@@ -543,7 +532,7 @@ def cmd_progress(args, ctx: Ctx) -> int:
         if args.handoff:
             it.add_entry("Handoff", args.handoff, ctx.owner)
         it.set("updated_at", stamp())
-        return f"{it.id} updated", {"id": it.id, "note": args.blocked or args.note or args.handoff, **moved}
+        return f"{it.id} updated", {"id": it.id, "note": args.blocked or args.note or args.handoff}
     print(ctx.mutate("progress", fn))
     return 0
 
@@ -551,7 +540,7 @@ def cmd_progress(args, ctx: Ctx) -> int:
 def cmd_complete(args, ctx: Ctx) -> int:
     def fn(b: Board):
         it = b.task_in(args.id, "In progress")
-        moved = ctx.own(it, args.force)
+        ctx.own(it, args.force)
         for e in args.evidence:
             it.add_entry("Evidence", e, ctx.owner)
         it.drop("blocked")
@@ -559,7 +548,7 @@ def cmd_complete(args, ctx: Ctx) -> int:
         it.set("updated_at", stamp())
         b.move(it, "In progress", "Done")
         return f"{it.id} done. Next: claim --plan {it.get('plan')}", {
-            "id": it.id, "from": "In progress", "to": "Done", "note": "; ".join(args.evidence), **moved}
+            "id": it.id, "from": "In progress", "to": "Done", "note": "; ".join(args.evidence)}
     print(ctx.mutate("complete", fn))
     return 0
 
@@ -612,9 +601,7 @@ def cmd_restore(args, ctx: Ctx) -> int:
         if old != text:
             r.snapshot(old)
             write_atomic(r.board, text)
-            with open(r.log, "a") as f:
-                f.write(json.dumps({"ts": stamp(), "owner": ctx.owner, "worktree": ctx.top,
-                                    "cmd": "restore", "note": path}) + "\n")
+            r.append_log({"owner": ctx.owner, "worktree": ctx.top, "cmd": "restore", "note": path})
     print(f"restored {path} (previous board saved as a new backup)")
     return 0
 
@@ -687,8 +674,10 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_BUSY
     except (BoardError, OSError) as e:
         print(f"taskboard: {e}", file=sys.stderr)
-        if ctx and isinstance(e, BoardError) and args.cmd not in READ_ONLY:
-            ctx.log_refusal(args.cmd, getattr(args, "id", None), str(e))
+        if ctx and args.cmd not in ("list", "show", "init"):
+            with contextlib.suppress(OSError):  # a refusal is history too, but must not change the outcome
+                ctx.repo.append_log({"owner": ctx.owner, "worktree": ctx.top, "cmd": args.cmd, "exit": EXIT_ERROR,
+                                     "reason": str(e), **({"id": args.id} if getattr(args, "id", None) else {})})
         return EXIT_ERROR
 
 
