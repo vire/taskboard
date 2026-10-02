@@ -21,7 +21,7 @@ Run it from inside your worktree. The first call connects the worktree, and ever
 | `show ID` | One task or plan in full |
 | `plan "Title" --body "scope"` | Create a plan; prints `P-001` |
 | `add "Title" --plan P-001 --outcome "..." --done-when "..." [--done-when ...] [--depends-on TB-0001,TB-0002]` | Add a task at the end of Todo; prints `TB-0001` |
-| `claim [--plan P-001] [ID]` | Claim the first eligible task for this worktree and print it |
+| `claim [--plan P-001] [ID]` | Claim the first eligible task for your owner and print it |
 | `progress ID [--note "..."] [--blocked "reason" \| --blocked none] [--handoff "..."]` | Record progress, set or clear a blocker, leave handoff notes |
 | `complete ID --evidence "..."` | Move to Done with evidence: commit SHA, PR link, file path, checks run |
 | `release ID --handoff "..."` | Put the task back on top of Todo for someone else |
@@ -39,8 +39,9 @@ Exit codes: `0` ok, `1` error (message says why, with `board.md:LINE` for a malf
 
 ## Rules
 
-- One agent per worktree. The helper allows one unblocked claim per worktree. Parallel implementation needs separate worktrees.
+- Identity is the owner label: `--owner`, else `$TASKBOARD_OWNER`, else `herdr:$HERDR_PANE_ID` inside Herdr, else `<agent>@<worktree>`. The helper allows one unblocked claim per owner, and only the owner may progress, complete or release a task. Parallel work needs separate owners and worktrees.
+- If you moved to another worktree, rerun with `--owner <owner shown on the task>`; the task then follows you to the new worktree.
 - Stay inside the assigned plan. Add subtasks the plan needs. Put broader discoveries in a plan titled `Proposals` (create it once) and do not claim them.
-- `--force` (acting on another worktree's task) and `restore` only when the user tells you to.
+- `--force` (acting on another owner's task) and `restore` only when the user tells you to.
 - `!stale` in `list` means a claim is older than `TASKBOARD_TTL_HOURS` (default 24). It is for the user to decide. Do not take the task over on your own.
 - On a malformed-board error, tell the user the line. Do not repair the file by hand unless asked.
