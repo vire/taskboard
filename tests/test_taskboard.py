@@ -6,6 +6,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 SCRIPT = os.path.join(os.path.dirname(__file__), "..", "skills", "taskboard", "taskboard.py")
@@ -153,6 +154,29 @@ class TaskboardTest(unittest.TestCase):
         self.assertEqual(claimed, sorted(ids))
         board = tb.Board(self.board_text())
         self.assertEqual(len(board.items["In progress"]), 8)
+
+    def test_quiet_flags_silent_doing_tasks_but_not_blocked_ones(self):
+        plan, (a, b, _) = self.seed()
+        self.ok(self.wts[0], "claim", a)
+        self.ok(self.wts[1], "claim", b)
+        self.assertNotIn("!quiet", self.ok(self.main, "list"))
+        os.environ["TASKBOARD_QUIET_MIN"] = "0"
+        try:
+            time.sleep(1.1)
+            self.ok(self.wts[1], "progress", b, "--blocked", "waiting")
+            rows = {l.split()[0]: l for l in self.ok(self.main, "list").splitlines()}
+        finally:
+            del os.environ["TASKBOARD_QUIET_MIN"]
+        self.assertIn("!quiet", rows[a])
+        self.assertNotIn("!quiet", rows[b])
+
+    def test_complete_takes_repeatable_evidence(self):
+        plan, (a, *_) = self.seed()
+        self.ok(self.wts[0], "claim", a)
+        self.ok(self.wts[0], "complete", a, "--evidence", "commit abc", "--evidence", "tests ok")
+        shown = self.ok(self.main, "show", a)
+        self.assertEqual(sum(1 for l in shown.splitlines() if l.startswith("- 20") and ("commit abc" in l or "tests ok" in l)), 2)
+        self.assertLess(shown.index("commit abc"), shown.index("tests ok"))
 
 
 if __name__ == "__main__":

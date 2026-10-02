@@ -403,9 +403,11 @@ def row(board: Board, section: str, it: Item) -> str:
         waiting = [d for d in it.deps if d not in {i.id for i in board.items["Done"]}]
         status, extra = ("waiting", f"needs {','.join(waiting)}") if waiting else ("ready", "")
     elif section == "In progress":
-        label, hours = age(it.get("claimed_at"))
+        hours = age(it.get("claimed_at"))[1]
+        label, idle = age(it.get("updated_at") or it.get("claimed_at"))
         status = "blocked" if it.blocked else "doing"
-        extra = f"{it.get('owner')} {label}" + (" !stale" if hours > ttl else "")
+        quiet = not it.blocked and idle * 60 > float(os.environ.get("TASKBOARD_QUIET_MIN", "30"))
+        extra = f"{it.get('owner')} {label}" + (" !stale" if hours > ttl else "") + (" !quiet" if quiet else "")
         if it.blocked:
             extra += f" ({it.blocked})"
     else:
@@ -528,13 +530,14 @@ def cmd_complete(args, ctx: Ctx) -> int:
     def fn(b: Board):
         it = b.task_in(args.id, "In progress")
         ctx.own(it, args.force)
-        it.add_entry("Evidence", args.evidence, ctx.owner)
+        for e in args.evidence:
+            it.add_entry("Evidence", e, ctx.owner)
         it.drop("blocked")
         it.set("completed_at", stamp())
         it.set("updated_at", stamp())
         b.move(it, "In progress", "Done")
         return f"{it.id} done. Next: claim --plan {it.get('plan')}", {
-            "id": it.id, "from": "In progress", "to": "Done", "note": args.evidence}
+            "id": it.id, "from": "In progress", "to": "Done", "note": "; ".join(args.evidence)}
     print(ctx.mutate("complete", fn))
     return 0
 
@@ -613,7 +616,7 @@ def parser() -> argparse.ArgumentParser:
     s.add_argument("--force", action="store_true", help="act on another worktree's task (user-directed only)")
     s = cmd("complete", cmd_complete, "move a task to Done with evidence (commit, PR, path, checks run)")
     s.add_argument("id")
-    s.add_argument("--evidence", required=True)
+    s.add_argument("--evidence", required=True, action="append", help="repeatable; one bullet each")
     s.add_argument("--force", action="store_true", help="act on another worktree's task (user-directed only)")
     s = cmd("release", cmd_release, "return a task to the top of Todo with a handoff note")
     s.add_argument("id")
