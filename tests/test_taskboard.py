@@ -27,6 +27,8 @@ class TaskboardTest(unittest.TestCase):
         self.env = {"XDG_DATA_HOME": os.path.join(root, "xdg"), "TASKBOARD_OWNER": "", "HERDR_ENV": "", "HERDR_PANE_ID": ""}
         self._old_env = {k: os.environ.get(k) for k in self.env}
         os.environ.update(self.env)
+        for k in ("TASKBOARD_QUIET_MIN", "TASKBOARD_TTL_HOURS"):  # a developer's own settings must not leak in
+            self._old_env[k] = os.environ.pop(k, None)
         self.main = os.path.join(root, "repo")
         os.makedirs(self.main)
         sh(self.main, "git", "init", "-q")
@@ -41,7 +43,7 @@ class TaskboardTest(unittest.TestCase):
     def tearDown(self):
         os.chdir(self.cwd)
         for k, v in self._old_env.items():
-            os.environ.pop(k) if v is None else os.environ.__setitem__(k, v)
+            os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
         self.tmp.cleanup()
 
     def tb(self, where, *argv):
@@ -155,6 +157,16 @@ class TaskboardTest(unittest.TestCase):
         self.ok(self.wts[0], "--owner", "x", "claim")
         self.assertEqual(self.tb(self.wts[0], "--owner", "x", "claim")[0], 1)
         self.assertIn(b, self.ok(self.wts[0], "--owner", "y", "claim"))
+
+    def test_default_identity_stays_bound_to_its_worktree(self):
+        plan, (a, *_) = self.seed()
+        root = os.path.dirname(self.main)
+        twins = [os.path.join(root, d, "same") for d in "xy"]
+        for n, wt in enumerate(twins):
+            sh(self.main, "git", "worktree", "add", "-q", "-b", f"twin{n}", wt)
+        self.ok(twins[0], "claim", a)
+        self.assertEqual(self.tb(twins[1], "complete", a, "--evidence", "x")[0], 1)  # same basename, other worktree
+        self.ok(twins[1], "claim")
 
     def test_herdr_pane_is_the_default_owner(self):
         self.seed(1)

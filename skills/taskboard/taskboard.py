@@ -373,8 +373,9 @@ class Ctx:
         agent = "claude" if os.environ.get("CLAUDECODE") else (
             "codex" if any(k.startswith("CODEX") for k in os.environ) else os.environ.get("USER", "agent"))
         herdr = os.environ.get("HERDR_PANE_ID") if os.environ.get("HERDR_ENV") == "1" else None
-        self.owner = (owner or os.environ.get("TASKBOARD_OWNER") or (f"herdr:{herdr}" if herdr else None)
-                      or f"{agent}@{os.path.basename(self.top)}")
+        explicit = owner or os.environ.get("TASKBOARD_OWNER") or (f"herdr:{herdr}" if herdr else None)
+        self.owner = explicit or f"{agent}@{os.path.basename(self.top)}"
+        self.portable = bool(explicit)  # the default identity is bound to its worktree (basenames can repeat)
 
     def mutate(self, cmd: str, fn):
         """Lock, reread, apply fn(board) -> (output, event), validate, snapshot, write, log."""
@@ -393,13 +394,15 @@ class Ctx:
             f.write(json.dumps(event) + "\n")
 
     def own(self, it: Item, force: bool) -> dict:
-        """Owner identity decides, not the worktree; the same owner in another worktree moves the task there."""
-        if it.get("owner") != self.owner and not force:
-            raise BoardError(f"{it.id} is held by {it.get('owner')} in {it.get('worktree')}, not by {self.owner}; "
-                             f"if you are that agent and moved worktrees, rerun with --owner {it.get('owner')}; "
-                             "otherwise only with the user's go-ahead, rerun with --force")
+        """The owner decides; an explicit owner in another worktree moves the task there."""
+        mine = it.get("owner") == self.owner and (self.portable or it.get("worktree") == self.top)
+        if not mine and not force:
+            raise BoardError(f"{it.id} is held by {it.get('owner')} (worktree {it.get('worktree')}); you are {self.owner}. "
+                             "If you did not claim it yourself, stop and ask the user (--force needs their go-ahead). "
+                             f"If you claimed it and only changed worktree, rerun with --owner {it.get('owner')} "
+                             "placed before the command")
         old = it.get("worktree")
-        if it.get("owner") != self.owner or old == self.top:
+        if not mine or old == self.top:
             return {}
         it.set("worktree", self.top)
         return {"moved_from": old}
@@ -420,11 +423,11 @@ def row(board: Board, section: str, it: Item) -> str:
         waiting = [d for d in it.deps if d not in {i.id for i in board.items["Done"]}]
         status, extra = ("waiting", f"needs {','.join(waiting)}") if waiting else ("ready", "")
     elif section == "In progress":
-        hours = age(it.get("claimed_at"))[1]
+        claimed, hours = age(it.get("claimed_at"))
         label, idle = age(it.get("updated_at") or it.get("claimed_at"))
         status = "blocked" if it.blocked else "doing"
         quiet = not it.blocked and idle * 60 > float(os.environ.get("TASKBOARD_QUIET_MIN", "30"))
-        extra = f"{it.get('owner')} {label}" + (" !stale" if hours > ttl else "") + (" !quiet" if quiet else "")
+        extra = f"{it.get('owner')} {label}" + (f" !stale {claimed}" if hours > ttl else "") + (" !quiet" if quiet else "")
         if it.blocked:
             extra += f" ({it.blocked})"
     else:
@@ -445,8 +448,9 @@ def cmd_list(args, ctx: Ctx) -> int:
     if not args.plan:
         for p in board.items["Plans"]:
             counts = {s: sum(1 for i in board.items[s] if i.get("plan") == p.id) for s in SECTIONS[1:]}
+            closed = sum(1 for i in board.items["Done"] if i.get("plan") == p.id and i.get("closed_at"))
             out.append(f"{p.id:<8} plan     {counts['Todo']} todo, {counts['In progress']} in progress, "
-                       f"{counts['Done']} done  {p.title}")
+                       f"{counts['Done'] - closed} done" + (f", {closed} closed" if closed else "") + f"  {p.title}")
     elif args.plan not in {p.id for p in board.items["Plans"]}:
         raise BoardError(f"no such plan {args.plan}")
     for section, it in board.tasks():
@@ -491,7 +495,8 @@ def cmd_add(args, ctx: Ctx) -> int:
 
 def cmd_claim(args, ctx: Ctx) -> int:
     def fn(b: Board):
-        held = [i for i in b.items["In progress"] if i.get("owner") == ctx.owner and not i.blocked]
+        held = [i for i in b.items["In progress"] if i.get("owner") == ctx.owner and not i.blocked
+                and (ctx.portable or i.get("worktree") == ctx.top)]
         if held:
             raise BoardError(f"{ctx.owner} already works on {held[0].id}; complete, block or release it first "
                              "(one unblocked task per owner, use another --owner for parallel work)")
@@ -562,14 +567,14 @@ def cmd_complete(args, ctx: Ctx) -> int:
 def cmd_release(args, ctx: Ctx) -> int:
     def fn(b: Board):
         it = b.task_in(args.id, "In progress")
-        moved = ctx.own(it, args.force)
+        ctx.own(it, args.force)
         who = it.get("owner")
         note = args.handoff if who == ctx.owner else f"(released from {who}) {args.handoff}"
         it.add_entry("Handoff", note, ctx.owner)
         it.drop("owner", "worktree", "claimed_at", "blocked")
         it.set("updated_at", stamp())
         b.move(it, "In progress", "Todo", top=True)
-        return f"{it.id} back on top of Todo", {"id": it.id, "from": "In progress", "to": "Todo", "note": note, **moved}
+        return f"{it.id} back on top of Todo", {"id": it.id, "from": "In progress", "to": "Todo", "note": note}
     print(ctx.mutate("release", fn))
     return 0
 
@@ -579,14 +584,15 @@ def cmd_close(args, ctx: Ctx) -> int:
         src, it = b.find(args.id)
         if src not in ("Todo", "In progress"):
             raise BoardError(f"{it.id} is in '{src}', not 'Todo' or 'In progress'")
-        moved = ctx.own(it, args.force) if src == "In progress" else {}
+        if src == "In progress":
+            ctx.own(it, args.force)
         note = f"closed: {args.reason}"
         it.add_entry("Evidence", note, ctx.owner)
         it.drop("owner", "worktree", "claimed_at", "blocked")
         it.set("closed_at", stamp())
         it.set("updated_at", stamp())
         b.move(it, src, "Done")
-        return f"{it.id} closed", {"id": it.id, "from": src, "to": "Done", "note": note, **moved}
+        return f"{it.id} closed", {"id": it.id, "from": src, "to": "Done", "note": note}
     print(ctx.mutate("close", fn))
     return 0
 

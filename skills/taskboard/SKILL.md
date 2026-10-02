@@ -10,14 +10,14 @@ One board per git clone, shared by every worktree of it: `<git-common-dir>/taskb
 ## Run the helper
 
 ```sh
-python3 <directory of this SKILL.md>/taskboard.py <command>
+python3 <directory of this SKILL.md>/taskboard.py [--owner NAME] <command>
 ```
 
-Run it from inside your worktree. The first call connects the worktree, and every later call repeats that check, so no setup step is needed. Do not read or edit `.taskboard/board.md` directly: `list` and `show` print what you need in fewer tokens, and the helper is the only safe way to write the board.
+Run it from inside your worktree. The first call connects the worktree, and every later call repeats that check, so no setup step is needed. After the first call, `python3 .taskboard/tb <command>` from the worktree root does the same. `--owner` goes before the command. Do not read or edit `.taskboard/board.md` directly: `list` and `show` print what you need in fewer tokens, and the helper is the only safe way to write the board.
 
 | Command | Use |
 |---|---|
-| `list [--plan P-001] [--all]` | One line per plan and open task: `ready`, `waiting [needs ...]`, `doing [owner age]`, `blocked`. `age` is time since last activity; `!quiet` marks a doing task silent for over `TASKBOARD_QUIET_MIN` minutes (default 30). Done and closed tasks only with `--all` |
+| `list [--plan P-001] [--all]` | One line per plan and open task: `ready`, `waiting [needs ...]`, `doing [owner age]`, `blocked`. `age` is time since last activity; `!quiet` marks a doing task silent for over `TASKBOARD_QUIET_MIN` minutes (default 30); `!stale 26h` shows the claim age. Plan lines count done and closed separately. Done and closed tasks only with `--all` |
 | `show ID` | One task or plan in full |
 | `plan "Title" --body "scope"` | Create a plan; prints `P-001` |
 | `add "Title" --plan P-001 --outcome "..." --done-when "..." [--done-when ...] [--depends-on TB-0001,TB-0002]` | Add a task at the end of Todo; prints `TB-0001` |
@@ -37,17 +37,17 @@ A refused state-changing command (exit `1`) also leaves a line with its reason i
 1. If asked to prepare the work: `plan`, then `add` small tasks in the order they should be done. Each needs one outcome sentence and checkable `--done-when` criteria. Use `--depends-on` only for real prerequisites in the same plan.
 2. `claim --plan P-001`. The output is your task. Work it in your own worktree.
 3. Record `progress ID --note` at each milestone. Before stopping on any refusal or permission prompt you cannot resolve, run `progress ID --blocked "reason"`. For merge or deploy waits use `progress ID --blocked "awaiting ..."`. You may then claim another eligible task.
-4. When every done-when criterion holds, `complete ID --evidence "..."`. A dependent task's owner reads your evidence, so name the commit, branch, PR or file.
+4. When every done-when criterion holds, `complete ID --evidence "..."`. A dependent task's owner reads your evidence, so name the commit, branch, PR or file: repo-relative paths, commit SHAs, URLs, checks run, no absolute paths outside your worktree. If your sandbox refuses `complete`, record the evidence with `progress ID --note "done-when met; evidence: ..."` and report it; the orchestrator or user completes the task with `--force`. Do not work around the refusal.
 5. Claim again. Stop when `claim` exits 3. Report the remaining tasks and blockers it printed.
 
 ## Prompting a worker
 
-One line is enough: `Use the taskboard skill and claim TB-0007`.
+One line is enough: `Use the taskboard skill with --owner worker-2 and claim TB-0007`. Give each worker in a shared checkout its own `--owner`: subagents inherit the orchestrator's environment, and a Herdr pane identifies only itself, not the agents it spawns.
 
 ## Rules
 
-- Identity is the owner label: `--owner`, else `$TASKBOARD_OWNER`, else `herdr:$HERDR_PANE_ID` inside Herdr, else `<agent>@<worktree>`. The helper allows one unblocked claim per owner, and only the owner may progress, complete or release a task. Parallel work needs separate owners and worktrees.
-- If you moved to another worktree, rerun with `--owner <owner shown on the task>`; the task then follows you to the new worktree.
+- Identity is the owner label: `--owner`, else `$TASKBOARD_OWNER`, else `herdr:$HERDR_PANE_ID` inside Herdr, else `<agent>@<worktree>`. The helper allows one unblocked claim per owner, and only the owner may progress, complete, release or close a task. Parallel work needs separate owners; work that changes files also needs separate worktrees.
+- The default `<agent>@<worktree>` identity is bound to its worktree. If you claimed a task and then moved to another worktree (or your Herdr pane moved and got a new id), pass `--owner <owner shown on the task>` on every later command; the task then follows you. Never pass another agent's owner: that needs the user's go-ahead, like `--force`.
 - Stay inside the assigned plan. Add subtasks the plan needs. Put broader discoveries in a plan titled `Proposals` (create it once) and do not claim them.
 - `close` only for a Proposals entry once the user has turned it into tickets, or a task the user says is superseded or dropped. Never to skip work.
 - `--force` (acting on another owner's task) and `restore` only when the user tells you to.
