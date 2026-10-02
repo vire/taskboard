@@ -114,6 +114,27 @@ class TaskboardTest(unittest.TestCase):
         self.assertNotIn("- worktree:", shown)
         self.assertIn(a, self.ok(self.wts[1], "claim", "--plan", plan).splitlines()[0])
 
+    def test_close_moves_todo_and_in_progress_tasks_to_done_as_closed(self):
+        plan = self.ok(self.main, "plan", "P")
+        a, b, c = (self.ok(self.main, "add", n, "--plan", plan, "--outcome", "o", "--done-when", "x") for n in "ABC")
+        self.ok(self.main, "add", "D", "--plan", plan, "--outcome", "o", "--done-when", "x", "--depends-on", a)
+        self.ok(self.wts[0], "claim", b)
+        self.assertEqual(self.tb(self.wts[1], "close", b, "--reason", "r")[0], 1)
+        self.ok(self.main, "close", a, "--reason", "moved to ticket X-1")
+        self.ok(self.wts[0], "close", b, "--reason", "dropped")
+        shown = self.ok(self.main, "show", b)
+        for text in ("closed: dropped", "- closed_at:", "- updated_at:"):
+            self.assertIn(text, shown)
+        for gone in ("- owner:", "- worktree:", "- claimed_at:"):
+            self.assertNotIn(gone, shown)
+        listed = self.ok(self.main, "list", "--all")
+        self.assertEqual([l.split()[1] for l in listed.splitlines() if l.startswith("TB-")], ["ready", "ready", "closed", "closed"])
+        self.assertIn(c, self.ok(self.wts[2], "claim", "--plan", plan))
+        self.assertIn("TB-0004", self.ok(self.wts[3], "claim", "--plan", plan))  # D no longer waits on closed A
+        self.assertEqual(self.tb(self.main, "close", a, "--reason", "again")[0], 1)
+        with open(os.path.join(self.main, ".taskboard", "log.jsonl")) as f:
+            self.assertIn('"cmd": "close", "id": "TB-0002", "from": "In progress", "to": "Done"', f.read())
+
     def test_render_round_trips_and_hand_edit_errors_name_the_line(self):
         plan, (a, *_) = self.seed()
         self.ok(self.wts[0], "claim")

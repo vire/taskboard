@@ -409,7 +409,7 @@ def row(board: Board, section: str, it: Item) -> str:
         if it.blocked:
             extra += f" ({it.blocked})"
     else:
-        status = "done"
+        status = "closed" if it.get("closed_at") else "done"
     return f"{it.id:<8} {status:<8} {it.get('plan'):<6} {it.title}" + (f"  [{extra}]" if extra else "")
 
 
@@ -554,6 +554,24 @@ def cmd_release(args, ctx: Ctx) -> int:
     return 0
 
 
+def cmd_close(args, ctx: Ctx) -> int:
+    def fn(b: Board):
+        src, it = b.find(args.id)
+        if src not in ("Todo", "In progress"):
+            raise BoardError(f"{it.id} is in '{src}', not 'Todo' or 'In progress'")
+        if src == "In progress":
+            ctx.own(it, args.force)
+        note = f"closed: {args.reason}"
+        it.add_entry("Evidence", note, ctx.owner)
+        it.drop("owner", "worktree", "claimed_at", "blocked")
+        it.set("closed_at", stamp())
+        it.set("updated_at", stamp())
+        b.move(it, src, "Done")
+        return f"{it.id} closed", {"id": it.id, "from": src, "to": "Done", "note": note}
+    print(ctx.mutate("close", fn))
+    return 0
+
+
 def cmd_restore(args, ctx: Ctx) -> int:
     r = ctx.repo
     if not args.backup:
@@ -590,7 +608,7 @@ def parser() -> argparse.ArgumentParser:
     cmd("init", cmd_init, "connect this worktree (every command does this implicitly) and print paths")
     s = cmd("list", cmd_list, "one line per plan and open task; done tasks only with --all")
     s.add_argument("--plan")
-    s.add_argument("--all", action="store_true", help="include done tasks")
+    s.add_argument("--all", action="store_true", help="include done and closed tasks")
     s = cmd("show", cmd_show, "print one task or plan in full")
     s.add_argument("id")
     s = cmd("plan", cmd_plan, "create a plan, prints its id")
@@ -619,6 +637,10 @@ def parser() -> argparse.ArgumentParser:
     s.add_argument("id")
     s.add_argument("--handoff", required=True)
     s.add_argument("--force", action="store_true", help="release another worktree's task (user-directed only)")
+    s = cmd("close", cmd_close, "move a Todo or In progress task to Done as closed (superseded, dropped) with a reason")
+    s.add_argument("id")
+    s.add_argument("--reason", required=True)
+    s.add_argument("--force", action="store_true", help="close another worktree's task (user-directed only)")
     s = cmd("restore", cmd_restore, "list backups, or restore one by name or path")
     s.add_argument("backup", nargs="?")
     return p
