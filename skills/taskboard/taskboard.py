@@ -338,6 +338,9 @@ class Repo:
             return
         self.snapshot(old)
         write_atomic(self.board, new)
+        self.append_log(event)
+
+    def append_log(self, event: dict) -> None:
         with open(self.log, "a") as f:
             f.write(json.dumps({"ts": stamp(), **event}) + "\n")
 
@@ -371,7 +374,10 @@ class Ctx:
         self.top = repo.top
         agent = "claude" if os.environ.get("CLAUDECODE") else (
             "codex" if any(k.startswith("CODEX") for k in os.environ) else os.environ.get("USER", "agent"))
-        self.owner = owner or os.environ.get("TASKBOARD_OWNER") or f"{agent}@{os.path.basename(self.top)}"
+        herdr = os.environ.get("HERDR_PANE_ID") if os.environ.get("HERDR_ENV") == "1" else None
+        # ponytail: worktrees sharing a basename share the default owner; set TASKBOARD_OWNER if that bites
+        self.owner = (owner or os.environ.get("TASKBOARD_OWNER") or (f"herdr:{herdr}" if herdr else None)
+                      or f"{agent}@{os.path.basename(self.top)}")
 
     def mutate(self, cmd: str, fn):
         """Lock, reread, apply fn(board) -> (output, event), validate, snapshot, write, log."""
@@ -383,9 +389,14 @@ class Ctx:
         return out
 
     def own(self, it: Item, force: bool) -> None:
-        if it.get("worktree") != self.top and not force:
-            raise BoardError(f"{it.id} is held by {it.get('owner')} in {it.get('worktree')}, not this worktree "
-                             f"({self.top}); only with the user's go-ahead, rerun with --force")
+        """The owner decides, not the worktree; the owner acting from another worktree moves the task there."""
+        if it.get("owner") != self.owner and not force:
+            raise BoardError(f"{it.id} is held by {it.get('owner')} (worktree {it.get('worktree')}); you are {self.owner}. "
+                             "If you did not claim it yourself, stop and ask the user (--force needs their go-ahead). "
+                             f"If you claimed it and only changed worktree, rerun with --owner {it.get('owner')} "
+                             "placed before the command")
+        if it.get("owner") == self.owner:
+            it.set("worktree", self.top)
 
 
 def age(ts: str) -> tuple[str, float]:
@@ -403,13 +414,15 @@ def row(board: Board, section: str, it: Item) -> str:
         waiting = [d for d in it.deps if d not in {i.id for i in board.items["Done"]}]
         status, extra = ("waiting", f"needs {','.join(waiting)}") if waiting else ("ready", "")
     elif section == "In progress":
-        label, hours = age(it.get("claimed_at"))
+        claimed, hours = age(it.get("claimed_at"))
+        label, idle = age(it.get("updated_at") or it.get("claimed_at"))
         status = "blocked" if it.blocked else "doing"
-        extra = f"{it.get('owner')} {label}" + (" !stale" if hours > ttl else "")
+        quiet = not it.blocked and idle * 60 > float(os.environ.get("TASKBOARD_QUIET_MIN", "30"))
+        extra = f"{it.get('owner')} {label}" + (f" !stale {claimed}" if hours > ttl else "") + (" !quiet" if quiet else "")
         if it.blocked:
             extra += f" ({it.blocked})"
     else:
-        status = "done"
+        status = "closed" if it.get("closed_at") else "done"
     return f"{it.id:<8} {status:<8} {it.get('plan'):<6} {it.title}" + (f"  [{extra}]" if extra else "")
 
 
@@ -472,10 +485,10 @@ def cmd_add(args, ctx: Ctx) -> int:
 
 def cmd_claim(args, ctx: Ctx) -> int:
     def fn(b: Board):
-        held = [i for i in b.items["In progress"] if i.get("worktree") == ctx.top and not i.blocked]
+        held = [i for i in b.items["In progress"] if i.get("owner") == ctx.owner and not i.blocked]
         if held:
-            raise BoardError(f"this worktree already works on {held[0].id}; complete, block or release it first "
-                             "(one unblocked task per worktree, use another worktree for parallel work)")
+            raise BoardError(f"{ctx.owner} already works on {held[0].id}; complete, block or release it first "
+                             "(one unblocked task per owner, use another --owner for parallel work)")
         if args.id:
             it = b.task_in(args.id, "Todo")
             if not b.ready(it):
@@ -528,13 +541,14 @@ def cmd_complete(args, ctx: Ctx) -> int:
     def fn(b: Board):
         it = b.task_in(args.id, "In progress")
         ctx.own(it, args.force)
-        it.add_entry("Evidence", args.evidence, ctx.owner)
+        for e in args.evidence:
+            it.add_entry("Evidence", e, ctx.owner)
         it.drop("blocked")
         it.set("completed_at", stamp())
         it.set("updated_at", stamp())
         b.move(it, "In progress", "Done")
         return f"{it.id} done. Next: claim --plan {it.get('plan')}", {
-            "id": it.id, "from": "In progress", "to": "Done", "note": args.evidence}
+            "id": it.id, "from": "In progress", "to": "Done", "note": "; ".join(args.evidence)}
     print(ctx.mutate("complete", fn))
     return 0
 
@@ -554,6 +568,24 @@ def cmd_release(args, ctx: Ctx) -> int:
     return 0
 
 
+def cmd_close(args, ctx: Ctx) -> int:
+    def fn(b: Board):
+        src, it = b.find(args.id)
+        if src not in ("Todo", "In progress"):
+            raise BoardError(f"{it.id} is in '{src}', not 'Todo' or 'In progress'")
+        if src == "In progress":
+            ctx.own(it, args.force)
+        note = f"closed: {args.reason}"
+        it.add_entry("Evidence", note, ctx.owner)
+        it.drop("owner", "worktree", "claimed_at", "blocked")
+        it.set("closed_at", stamp())
+        it.set("updated_at", stamp())
+        b.move(it, src, "Done")
+        return f"{it.id} closed", {"id": it.id, "from": src, "to": "Done", "note": note}
+    print(ctx.mutate("close", fn))
+    return 0
+
+
 def cmd_restore(args, ctx: Ctx) -> int:
     r = ctx.repo
     if not args.backup:
@@ -569,9 +601,7 @@ def cmd_restore(args, ctx: Ctx) -> int:
         if old != text:
             r.snapshot(old)
             write_atomic(r.board, text)
-            with open(r.log, "a") as f:
-                f.write(json.dumps({"ts": stamp(), "owner": ctx.owner, "worktree": ctx.top,
-                                    "cmd": "restore", "note": path}) + "\n")
+            r.append_log({"owner": ctx.owner, "worktree": ctx.top, "cmd": "restore", "note": path})
     print(f"restored {path} (previous board saved as a new backup)")
     return 0
 
@@ -579,7 +609,7 @@ def cmd_restore(args, ctx: Ctx) -> int:
 def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="taskboard", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--owner", help="label for claims (default: $TASKBOARD_OWNER or <agent>@<worktree>)")
+    p.add_argument("--owner", help="identity for claims and ownership (default: $TASKBOARD_OWNER, else herdr:$HERDR_PANE_ID in Herdr, else <agent>@<worktree>)")
     sub = p.add_subparsers(dest="cmd", required=True, metavar="command")
 
     def cmd(name, fn, help_):
@@ -590,7 +620,7 @@ def parser() -> argparse.ArgumentParser:
     cmd("init", cmd_init, "connect this worktree (every command does this implicitly) and print paths")
     s = cmd("list", cmd_list, "one line per plan and open task; done tasks only with --all")
     s.add_argument("--plan")
-    s.add_argument("--all", action="store_true", help="include done tasks")
+    s.add_argument("--all", action="store_true", help="include done and closed tasks")
     s = cmd("show", cmd_show, "print one task or plan in full")
     s.add_argument("id")
     s = cmd("plan", cmd_plan, "create a plan, prints its id")
@@ -602,7 +632,7 @@ def parser() -> argparse.ArgumentParser:
     s.add_argument("--outcome", required=True, help="what is true when the task is done")
     s.add_argument("--done-when", required=True, action="append", help="checkable criterion (repeatable)")
     s.add_argument("--depends-on", help="comma separated task ids from the same plan")
-    s = cmd("claim", cmd_claim, "claim the first eligible task (or ID) for this worktree and print it")
+    s = cmd("claim", cmd_claim, "claim the first eligible task (or ID) for your owner and print it")
     s.add_argument("id", nargs="?")
     s.add_argument("--plan")
     s = cmd("progress", cmd_progress, "record progress, a blocker (--blocked none clears it) or a handoff note")
@@ -610,15 +640,19 @@ def parser() -> argparse.ArgumentParser:
     s.add_argument("--note")
     s.add_argument("--blocked")
     s.add_argument("--handoff")
-    s.add_argument("--force", action="store_true", help="act on another worktree's task (user-directed only)")
+    s.add_argument("--force", action="store_true", help="act on another owner's task (user-directed only)")
     s = cmd("complete", cmd_complete, "move a task to Done with evidence (commit, PR, path, checks run)")
     s.add_argument("id")
-    s.add_argument("--evidence", required=True)
-    s.add_argument("--force", action="store_true", help="act on another worktree's task (user-directed only)")
+    s.add_argument("--evidence", required=True, action="append", help="repeatable; one bullet each")
+    s.add_argument("--force", action="store_true", help="act on another owner's task (user-directed only)")
     s = cmd("release", cmd_release, "return a task to the top of Todo with a handoff note")
     s.add_argument("id")
     s.add_argument("--handoff", required=True)
-    s.add_argument("--force", action="store_true", help="release another worktree's task (user-directed only)")
+    s.add_argument("--force", action="store_true", help="release another owner's task (user-directed only)")
+    s = cmd("close", cmd_close, "move a Todo or In progress task to Done as closed (superseded, dropped) with a reason")
+    s.add_argument("id")
+    s.add_argument("--reason", required=True)
+    s.add_argument("--force", action="store_true", help="close another owner's task (user-directed only)")
     s = cmd("restore", cmd_restore, "list backups, or restore one by name or path")
     s.add_argument("backup", nargs="?")
     return p
@@ -626,10 +660,12 @@ def parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
+    ctx = None
     try:
         repo = Repo()
         repo.ensure_init()
-        return args.fn(args, Ctx(repo, args.owner))
+        ctx = Ctx(repo, args.owner)
+        return args.fn(args, ctx)
     except NothingEligible as e:
         print(e)
         return EXIT_NOTHING
@@ -638,6 +674,10 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_BUSY
     except (BoardError, OSError) as e:
         print(f"taskboard: {e}", file=sys.stderr)
+        if ctx and args.cmd not in ("list", "show", "init"):
+            with contextlib.suppress(OSError):  # a refusal is history too, but must not change the outcome
+                ctx.repo.append_log({"owner": ctx.owner, "worktree": ctx.top, "cmd": args.cmd, "exit": EXIT_ERROR,
+                                     "reason": str(e), **({"id": args.id} if getattr(args, "id", None) else {})})
         return EXIT_ERROR
 
 

@@ -45,7 +45,8 @@ python3 .taskboard/tb --help
 
 - **Storage.** `<git-common-dir>/taskboard/board.md` holds four sections: `## Plans`, `## Todo`, `## In progress`, `## Done`. The section a task sits in is its status. All worktrees of a clone share one board; separate clones have separate boards.
 - **Tasks.** Each task is a `### TB-0001 - Title` block. Below the heading come `- key: value` fields (`plan`, `depends_on`, `owner`, `worktree`, `claimed_at`, `blocked`, ...), followed by `#### Outcome`, `#### Done when`, `#### Progress`, `#### Handoff` and `#### Evidence`.
-- **Claims.** `claim` takes the first task in Todo order whose dependencies are all done. Ownership belongs to the worktree, so nothing has to be remembered between agent turns. A worktree holds at most one unblocked task. Acting on another worktree's task needs `--force`, which the skill reserves for user instructions.
+- **Claims.** `claim` takes the first task in Todo order whose dependencies are all done. A task belongs to its owner label, and each owner holds at most one unblocked task. The default owner is `herdr:<pane id>` inside Herdr, else `<agent>@<worktree name>`, so nothing has to be remembered between agent turns. Give agents distinct owners (`--owner`, `$TASKBOARD_OWNER`) and several can share one checkout; a task follows its owner to another worktree. Acting on another owner's task needs `--force`, which the skill reserves for user instructions.
+- **Closing.** `close ID --reason` moves a task to Done marked `closed` (superseded by an external ticket, dropped). Dependents treat it like a done task.
 - **Concurrency.** Every write takes one `flock`, rereads and validates the board, applies the change, and replaces `board.md` atomically (temp file, fsync, `os.replace`). A crash leaves either the old board or the new one. Reads take no lock. If the lock stays busy for 10 s, the command exits `75`.
 - **Hand edits.** You can edit `board.md` by hand while no agent is writing. The next command validates the file and refuses to continue on errors, naming the line, such as an unknown section, a duplicate id, a missing plan or dependency, or a cycle. Edits made while agents write are last-writer-wins.
 
@@ -69,7 +70,7 @@ Each change appends a line to `<git-common-dir>/taskboard/log.jsonl`:
 {"ts": "2026-10-02T09:00:00Z", "owner": "codex@retry-wt", "worktree": "/path/retry-wt", "cmd": "complete", "id": "TB-0003", "from": "In progress", "to": "Done", "note": "commit abc123"}
 ```
 
-The log is an audit trail, not a recovery source: hand edits do not appear in it. For recovery, use the backups.
+A refused state-changing command adds a line with `"exit": 1` and its `reason`. The log is an audit trail, not a recovery source: hand edits do not appear in it. For recovery, use the backups.
 
 ```sh
 tail -n 20 .taskboard/log.jsonl
@@ -79,16 +80,18 @@ tail -n 20 .taskboard/log.jsonl
 
 | Variable | Default | Effect |
 |---|---|---|
-| `TASKBOARD_OWNER` | `<agent>@<worktree name>` | Owner label written on claims (informational; ownership is the worktree) |
-| `TASKBOARD_TTL_HOURS` | `24` | Claims older than this show `!stale` in `list` |
+| `TASKBOARD_OWNER` | `herdr:$HERDR_PANE_ID` inside Herdr, else `<agent>@<worktree name>` | Owner identity for claims; `--owner` overrides it |
+| `TASKBOARD_TTL_HOURS` | `24` | Claims older than this show `!stale <claim age>` in `list` |
+| `TASKBOARD_QUIET_MIN` | `30` | Doing tasks with no activity for longer show `!quiet` in `list` |
 | `XDG_DATA_HOME` | `~/.local/share` | Backup root |
 
 ## Known limits
 
-- **Sandboxes.** The board sits under the clone's `.git` directory, outside every linked worktree. If a Codex `workspace-write` sandbox or the Claude Code sandbox denies the write, add `<clone>/.git/taskboard` to its writable roots, or approve the command once.
+- **Sandboxes.** The board sits under the clone's `.git` directory, outside every linked worktree. If a Codex `workspace-write` sandbox or the Claude Code sandbox denies the write, add `<clone>/.git/taskboard` to its writable roots, or approve the command once. Claude Code's subagent worktree guard has been seen refusing `complete` while allowing `claim` and `progress`; the skill tells agents to record the evidence with `progress` and leave `complete` to the orchestrator or user.
 - **Editors.** ripgrep does not follow the `.taskboard` symlink. VS Code does, so add `"**/.taskboard": true` to `files.exclude` / `search.exclude` if board hits get in the way.
 - **Stale `tb` link.** `.taskboard/tb` links to the helper that ran last. After a plugin update moves the skill, the next run through the skill path repairs the link.
 - **Platforms.** macOS and Linux only, because the helper needs `fcntl` and symlinks. Requires git 2.31+.
+- **Same-named worktrees.** Two worktrees whose folders share a name get the same default owner. Set `TASKBOARD_OWNER` in one of them.
 - **Scope.** One machine, one clone. There is no sync between clones or machines, no automatic reassignment of stale claims, and no history beyond the backups and log.
 
 ## Design notes
@@ -97,7 +100,7 @@ v1 implements the [local agent taskboard plan](docs/plan-v1.md) with these delib
 
 - **One `board.md` instead of `index.md`, `todo.md`, `inprogress.md` and `done.md`.** Moving a task becomes one atomic file replace, so the `pending.json` intent record and the recovery pass are not needed.
 - **The helper lives in the installed skill only.** No copy goes inside each board, so one version is used everywhere.
-- **Ownership is the worktree, not a claim token.** A token stored in plaintext on the board protects nothing, and agents would have to carry it across turns.
+- **Ownership is an owner label, not a claim token.** A token stored in plaintext on the board protects nothing, and agents would have to carry it across turns. v1 tied ownership to the worktree; real use showed agents moving to a fresh worktree after claiming and several read-only agents sharing one checkout, so ownership moved to the owner label.
 - **Expiry is a `!stale` flag in `list`.** There are no `expires_at`, `renew` or `sweep` commands. A takeover is `release --force` with a handoff note.
 - **No `edit` command that holds the lock.** Hand edits are validated on the next command instead.
 

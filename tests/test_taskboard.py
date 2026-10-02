@@ -3,9 +3,11 @@ import contextlib
 import importlib.util
 import io
 import os
+import pathlib
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 SCRIPT = os.path.join(os.path.dirname(__file__), "..", "skills", "taskboard", "taskboard.py")
@@ -22,9 +24,11 @@ class TaskboardTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         root = os.path.realpath(self.tmp.name)
-        self.env = {"XDG_DATA_HOME": os.path.join(root, "xdg"), "TASKBOARD_OWNER": ""}
+        self.env = {"XDG_DATA_HOME": os.path.join(root, "xdg"), "TASKBOARD_OWNER": "", "HERDR_ENV": "", "HERDR_PANE_ID": ""}
         self._old_env = {k: os.environ.get(k) for k in self.env}
         os.environ.update(self.env)
+        for k in ("TASKBOARD_QUIET_MIN", "TASKBOARD_TTL_HOURS"):  # a developer's own settings must not leak in
+            self._old_env[k] = os.environ.pop(k, None)
         self.main = os.path.join(root, "repo")
         os.makedirs(self.main)
         sh(self.main, "git", "init", "-q")
@@ -39,7 +43,7 @@ class TaskboardTest(unittest.TestCase):
     def tearDown(self):
         os.chdir(self.cwd)
         for k, v in self._old_env.items():
-            os.environ.pop(k) if v is None else os.environ.__setitem__(k, v)
+            os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
         self.tmp.cleanup()
 
     def tb(self, where, *argv):
@@ -114,6 +118,49 @@ class TaskboardTest(unittest.TestCase):
         self.assertNotIn("- worktree:", shown)
         self.assertIn(a, self.ok(self.wts[1], "claim", "--plan", plan).splitlines()[0])
 
+    def test_close_moves_todo_and_in_progress_tasks_to_done_as_closed(self):
+        plan = self.ok(self.main, "plan", "P")
+        a, b, c = (self.ok(self.main, "add", n, "--plan", plan, "--outcome", "o", "--done-when", "x") for n in "ABC")
+        self.ok(self.main, "add", "D", "--plan", plan, "--outcome", "o", "--done-when", "x", "--depends-on", a)
+        self.ok(self.wts[0], "claim", b)
+        self.assertEqual(self.tb(self.wts[1], "close", b, "--reason", "r")[0], 1)
+        self.ok(self.main, "close", a, "--reason", "moved to ticket X-1")
+        self.ok(self.wts[0], "close", b, "--reason", "dropped")
+        shown = self.ok(self.main, "show", b)
+        for text in ("closed: dropped", "- closed_at:", "- updated_at:"):
+            self.assertIn(text, shown)
+        for gone in ("- owner:", "- worktree:", "- claimed_at:"):
+            self.assertNotIn(gone, shown)
+        listed = self.ok(self.main, "list", "--all")
+        self.assertEqual([l.split()[1] for l in listed.splitlines() if l.startswith("TB-")], ["ready", "ready", "closed", "closed"])
+        self.assertIn(c, self.ok(self.wts[2], "claim", "--plan", plan))
+        self.assertIn("TB-0004", self.ok(self.wts[3], "claim", "--plan", plan))  # D no longer waits on closed A
+        self.assertEqual(self.tb(self.main, "close", a, "--reason", "again")[0], 1)
+        with open(os.path.join(self.main, ".taskboard", "log.jsonl")) as f:
+            self.assertIn('"cmd": "close", "id": "TB-0002", "from": "In progress", "to": "Done"', f.read())
+
+    def test_same_owner_moves_worktree_and_other_owner_is_refused(self):
+        plan, (a, *_) = self.seed()
+        self.ok(self.wts[0], "--owner", "me", "claim", a)
+        code, out = self.tb(self.wts[1], "--owner", "you", "complete", a, "--evidence", "x")
+        self.assertEqual(code, 1)
+        self.assertIn("--owner me", out)
+        self.ok(self.wts[1], "--owner", "me", "complete", a, "--evidence", "x")
+        shown = self.ok(self.main, "show", a)
+        self.assertIn("[Done]", shown)
+        self.assertIn(f"- worktree: {self.wts[1]}", shown)
+
+    def test_two_owners_can_claim_in_one_worktree(self):
+        plan, (a, b, _) = self.seed()
+        self.ok(self.wts[0], "--owner", "x", "claim")
+        self.assertEqual(self.tb(self.wts[0], "--owner", "x", "claim")[0], 1)
+        self.assertIn(b, self.ok(self.wts[0], "--owner", "y", "claim"))
+
+    def test_herdr_pane_is_the_default_owner(self):
+        self.seed(1)
+        os.environ.update(HERDR_ENV="1", HERDR_PANE_ID="p7")
+        self.assertIn("- owner: herdr:p7", self.ok(self.wts[0], "claim"))
+
     def test_render_round_trips_and_hand_edit_errors_name_the_line(self):
         plan, (a, *_) = self.seed()
         self.ok(self.wts[0], "claim")
@@ -143,6 +190,23 @@ class TaskboardTest(unittest.TestCase):
         self.ok(self.main, "add", "Task 1", "--plan", "P-001", "--outcome", "It works.", "--done-when", "checks pass")
         self.assertEqual(self.board_text(), good)
 
+    def test_refused_mutation_is_logged_but_reads_and_exit_3_are_not(self):
+        plan, (a, *_) = self.seed(1)
+        self.ok(self.wts[0], "claim", a)
+        log = os.path.join(self.main, ".taskboard", "log.jsonl")
+        lines = lambda: pathlib.Path(log).read_text().splitlines()
+        before = len(lines())
+        code, out = self.tb(self.wts[1], "complete", a, "--evidence", "x")
+        self.assertEqual(code, 1)
+        self.assertIn("is held by", out)
+        self.assertEqual(len(lines()), before + 1)
+        entry = tb.json.loads(lines()[-1])
+        self.assertEqual((entry["cmd"], entry["exit"], entry["id"], entry["worktree"]), ("complete", 1, a, self.wts[1]))
+        self.assertIn("is held by", entry["reason"])
+        self.assertEqual(self.tb(self.main, "show", "TB-9999")[0], 1)
+        self.assertEqual(self.tb(self.wts[1], "claim", "--plan", plan)[0], 3)
+        self.assertEqual(len(lines()), before + 1)
+
     def test_concurrent_claims_each_take_a_distinct_task(self):
         plan, ids = self.seed(8)
         procs = [subprocess.Popen([sys.executable, SCRIPT, "claim", "--plan", plan], cwd=wt,
@@ -153,6 +217,29 @@ class TaskboardTest(unittest.TestCase):
         self.assertEqual(claimed, sorted(ids))
         board = tb.Board(self.board_text())
         self.assertEqual(len(board.items["In progress"]), 8)
+
+    def test_quiet_flags_silent_doing_tasks_but_not_blocked_ones(self):
+        plan, (a, b, _) = self.seed()
+        self.ok(self.wts[0], "claim", a)
+        self.ok(self.wts[1], "claim", b)
+        self.assertNotIn("!quiet", self.ok(self.main, "list"))
+        os.environ["TASKBOARD_QUIET_MIN"] = "0"
+        try:
+            time.sleep(1.1)
+            self.ok(self.wts[1], "progress", b, "--blocked", "waiting")
+            rows = {l.split()[0]: l for l in self.ok(self.main, "list").splitlines()}
+        finally:
+            del os.environ["TASKBOARD_QUIET_MIN"]
+        self.assertIn("!quiet", rows[a])
+        self.assertNotIn("!quiet", rows[b])
+
+    def test_complete_takes_repeatable_evidence(self):
+        plan, (a, *_) = self.seed()
+        self.ok(self.wts[0], "claim", a)
+        self.ok(self.wts[0], "complete", a, "--evidence", "commit abc", "--evidence", "tests ok")
+        shown = self.ok(self.main, "show", a)
+        self.assertEqual(sum(1 for l in shown.splitlines() if l.startswith("- 20") and ("commit abc" in l or "tests ok" in l)), 2)
+        self.assertLess(shown.index("commit abc"), shown.index("tests ok"))
 
 
 if __name__ == "__main__":
