@@ -1,0 +1,159 @@
+"""Run with: python3 -m unittest discover -s tests"""
+import contextlib
+import importlib.util
+import io
+import os
+import subprocess
+import sys
+import tempfile
+import unittest
+
+SCRIPT = os.path.join(os.path.dirname(__file__), "..", "skills", "taskboard", "taskboard.py")
+spec = importlib.util.spec_from_file_location("taskboard", SCRIPT)
+tb = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(tb)
+
+
+def sh(cwd, *cmd):
+    subprocess.run(cmd, cwd=cwd, check=True, capture_output=True)
+
+
+class TaskboardTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = os.path.realpath(self.tmp.name)
+        self.env = {"XDG_DATA_HOME": os.path.join(root, "xdg"), "TASKBOARD_OWNER": ""}
+        self._old_env = {k: os.environ.get(k) for k in self.env}
+        os.environ.update(self.env)
+        self.main = os.path.join(root, "repo")
+        os.makedirs(self.main)
+        sh(self.main, "git", "init", "-q")
+        sh(self.main, "git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "x")
+        self.wts = []
+        for n in range(8):
+            wt = os.path.join(root, f"wt{n}")
+            sh(self.main, "git", "worktree", "add", "-q", "-b", f"b{n}", wt)
+            self.wts.append(wt)
+        self.cwd = os.getcwd()
+
+    def tearDown(self):
+        os.chdir(self.cwd)
+        for k, v in self._old_env.items():
+            os.environ.pop(k) if v is None else os.environ.__setitem__(k, v)
+        self.tmp.cleanup()
+
+    def tb(self, where, *argv):
+        os.chdir(where)
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = tb.main(list(argv))
+        return code, out.getvalue() + err.getvalue()
+
+    def ok(self, where, *argv):
+        code, out = self.tb(where, *argv)
+        self.assertEqual(code, 0, out)
+        return out.strip()
+
+    def board_text(self):
+        with open(os.path.join(self.main, ".taskboard", "board.md")) as f:
+            return f.read()
+
+    def seed(self, n=3):
+        plan = self.ok(self.main, "plan", "Retry work", "--body", "Make retries safe.")
+        ids = [self.ok(self.main, "add", f"Task {i}", "--plan", plan, "--outcome", "It works.",
+                       "--done-when", "checks pass") for i in range(n)]
+        return plan, ids
+
+    def test_any_run_links_every_existing_worktree(self):
+        self.ok(self.main, "list")
+        for wt in self.wts:
+            self.assertTrue(os.path.exists(os.path.join(wt, ".taskboard", "tb")), wt)
+
+    def test_init_is_idempotent_and_hidden_from_git(self):
+        for where in (self.main, self.wts[0], self.main):
+            self.ok(where, "init")
+        self.assertEqual(os.path.realpath(os.path.join(self.wts[0], ".taskboard")),
+                         os.path.realpath(os.path.join(self.main, ".taskboard")))
+        with open(os.path.join(self.main, ".git", "info", "exclude")) as f:
+            self.assertEqual(f.read().splitlines().count("/.taskboard"), 1)
+        status = subprocess.run(["git", "status", "--porcelain"], cwd=self.wts[0], capture_output=True, text=True, check=True)
+        self.assertEqual(status.stdout, "")
+        self.assertTrue(os.path.exists(os.path.join(self.main, ".taskboard", "tb")))
+
+    def test_claim_follows_board_order_dependencies_and_one_task_per_worktree(self):
+        plan = self.ok(self.main, "plan", "P")
+        a = self.ok(self.main, "add", "A", "--plan", plan, "--outcome", "a", "--done-when", "x")
+        b = self.ok(self.main, "add", "B", "--plan", plan, "--outcome", "b", "--done-when", "x", "--depends-on", a)
+        c = self.ok(self.main, "add", "C", "--plan", plan, "--outcome", "c", "--done-when", "x")
+        self.assertIn(a, self.ok(self.wts[0], "claim", "--plan", plan).splitlines()[0])
+        code, out = self.tb(self.wts[0], "claim", "--plan", plan)
+        self.assertEqual(code, 1, out)
+        self.assertIn(c, self.ok(self.wts[1], "claim", "--plan", plan).splitlines()[0])
+        code, out = self.tb(self.wts[2], "claim", "--plan", plan)
+        self.assertEqual(code, 3)
+        self.assertIn(f"needs {a}", out)
+        self.ok(self.wts[0], "complete", a, "--evidence", "commit abc123")
+        self.assertIn(b, self.ok(self.wts[0], "claim", "--plan", plan).splitlines()[0])
+        self.ok(self.wts[0], "complete", b, "--evidence", "e")
+        self.ok(self.wts[1], "complete", c, "--evidence", "e")
+        code, out = self.tb(self.wts[0], "claim", "--plan", plan)
+        self.assertEqual(code, 3)
+        self.assertIn("every task is done", out)
+
+    def test_ownership_force_release_and_progress(self):
+        plan, (a, *_) = self.seed()
+        self.ok(self.wts[0], "claim", "--plan", plan)
+        self.assertEqual(self.tb(self.wts[1], "complete", a, "--evidence", "x")[0], 1)
+        self.ok(self.wts[0], "progress", a, "--blocked", "waiting on API key", "--note", "half done")
+        self.assertIn("blocked", self.ok(self.main, "list"))
+        self.ok(self.wts[0], "claim", "--plan", plan)  # blocked task does not count against the worktree
+        self.ok(self.wts[1], "release", a, "--handoff", "owner left", "--force")
+        shown = self.ok(self.main, "show", a)
+        self.assertIn("[Todo]", shown)
+        self.assertIn("owner left", shown)
+        self.assertNotIn("- worktree:", shown)
+        self.assertIn(a, self.ok(self.wts[1], "claim", "--plan", plan).splitlines()[0])
+
+    def test_render_round_trips_and_hand_edit_errors_name_the_line(self):
+        plan, (a, *_) = self.seed()
+        self.ok(self.wts[0], "claim")
+        self.ok(self.wts[0], "progress", a, "--note", "line one\nline two", "--handoff", "see commit")
+        text = self.board_text()
+        self.assertEqual(tb.Board(text).render(), text)
+        with open(os.path.join(self.main, ".taskboard", "board.md"), "a") as f:
+            f.write("\n### not a task\n")
+        code, out = self.tb(self.main, "list")
+        self.assertEqual(code, 1)
+        self.assertIn(f"board.md:{len(text.splitlines()) + 2}:", out)
+        with open(os.path.join(self.main, ".taskboard", "board.md"), "w") as f:
+            f.write(text.replace(f"### {a} - Task 0\n- plan: {plan}", f"### {a} - Task 0\n- plan: {plan}\n- depends_on: {a}"))
+        code, out = self.tb(self.main, "list")
+        self.assertIn("cycle", out)
+
+    def test_every_change_is_backed_up_logged_and_restorable(self):
+        self.seed(2)
+        good = self.board_text()
+        with open(os.path.join(self.main, ".taskboard", "log.jsonl")) as f:
+            self.assertEqual([l.count('"cmd"') for l in f], [1, 1, 1])
+        os.remove(os.path.join(self.main, ".taskboard", "board.md"))
+        self.assertNotIn("Task", self.ok(self.main, "list"))  # board recreated empty
+        backups = self.ok(self.main, "restore").splitlines()[1:]
+        self.assertEqual(len(backups), 3)  # each change saved the board as it was before
+        self.ok(self.main, "restore", backups[0])  # newest: plan + first task
+        self.ok(self.main, "add", "Task 1", "--plan", "P-001", "--outcome", "It works.", "--done-when", "checks pass")
+        self.assertEqual(self.board_text(), good)
+
+    def test_concurrent_claims_each_take_a_distinct_task(self):
+        plan, ids = self.seed(8)
+        procs = [subprocess.Popen([sys.executable, SCRIPT, "claim", "--plan", plan], cwd=wt,
+                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True) for wt in self.wts]
+        outs = [p.communicate()[0] for p in procs]
+        self.assertEqual([p.returncode for p in procs], [0] * 8, outs)
+        claimed = sorted(o.split()[1] for o in outs)
+        self.assertEqual(claimed, sorted(ids))
+        board = tb.Board(self.board_text())
+        self.assertEqual(len(board.items["In progress"]), 8)
+
+
+if __name__ == "__main__":
+    unittest.main()

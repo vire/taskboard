@@ -1,0 +1,14 @@
+{
+  "name": "vire",
+  "description": "Agent skills by Viliam Elischer.",
+  "owner": {
+    "name": "Viliam Elischer"
+  },
+  "plugins": [
+    {
+      "name": "taskboard",
+      "source": "./",
+      "description": "Local Markdown taskboard that lets several coding agents share plans and tasks across the worktrees of one git clone."
+    }
+  ]
+}

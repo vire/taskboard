@@ -1,0 +1,8 @@
+{
+  "name": "taskboard",
+  "version": "0.1.0",
+  "description": "Local Markdown taskboard that lets several coding agents share plans and tasks across the worktrees of one git clone.",
+  "author": { "name": "Viliam Elischer" },
+  "repository": "https://github.com/vire/taskboard",
+  "license": "MIT"
+}
