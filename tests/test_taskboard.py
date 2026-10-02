@@ -24,7 +24,7 @@ class TaskboardTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         root = os.path.realpath(self.tmp.name)
-        self.env = {"XDG_DATA_HOME": os.path.join(root, "xdg"), "TASKBOARD_OWNER": ""}
+        self.env = {"XDG_DATA_HOME": os.path.join(root, "xdg"), "TASKBOARD_OWNER": "", "HERDR_ENV": "", "HERDR_PANE_ID": ""}
         self._old_env = {k: os.environ.get(k) for k in self.env}
         os.environ.update(self.env)
         self.main = os.path.join(root, "repo")
@@ -137,6 +137,30 @@ class TaskboardTest(unittest.TestCase):
         with open(os.path.join(self.main, ".taskboard", "log.jsonl")) as f:
             self.assertIn('"cmd": "close", "id": "TB-0002", "from": "In progress", "to": "Done"', f.read())
 
+    def test_same_owner_moves_worktree_and_other_owner_is_refused(self):
+        plan, (a, *_) = self.seed()
+        self.ok(self.wts[0], "--owner", "me", "claim", a)
+        code, out = self.tb(self.wts[1], "--owner", "you", "complete", a, "--evidence", "x")
+        self.assertEqual(code, 1)
+        self.assertIn("--owner me", out)
+        self.ok(self.wts[1], "--owner", "me", "complete", a, "--evidence", "x")
+        shown = self.ok(self.main, "show", a)
+        self.assertIn("[Done]", shown)
+        self.assertIn(f"- worktree: {self.wts[1]}", shown)
+        with open(os.path.join(self.main, ".taskboard", "log.jsonl")) as f:
+            self.assertIn(f'"moved_from": "{self.wts[0]}"', f.read())
+
+    def test_two_owners_can_claim_in_one_worktree(self):
+        plan, (a, b, _) = self.seed()
+        self.ok(self.wts[0], "--owner", "x", "claim")
+        self.assertEqual(self.tb(self.wts[0], "--owner", "x", "claim")[0], 1)
+        self.assertIn(b, self.ok(self.wts[0], "--owner", "y", "claim"))
+
+    def test_herdr_pane_is_the_default_owner(self):
+        self.seed(1)
+        os.environ.update(HERDR_ENV="1", HERDR_PANE_ID="p7")
+        self.assertIn("- owner: herdr:p7", self.ok(self.wts[0], "claim"))
+
     def test_render_round_trips_and_hand_edit_errors_name_the_line(self):
         plan, (a, *_) = self.seed()
         self.ok(self.wts[0], "claim")
@@ -174,11 +198,11 @@ class TaskboardTest(unittest.TestCase):
         before = len(lines())
         code, out = self.tb(self.wts[1], "complete", a, "--evidence", "x")
         self.assertEqual(code, 1)
-        self.assertIn("not this worktree", out)
+        self.assertIn("is held by", out)
         self.assertEqual(len(lines()), before + 1)
         entry = tb.json.loads(lines()[-1])
         self.assertEqual((entry["cmd"], entry["exit"], entry["id"], entry["worktree"]), ("complete", 1, a, self.wts[1]))
-        self.assertIn("not this worktree", entry["reason"])
+        self.assertIn("is held by", entry["reason"])
         self.assertEqual(self.tb(self.main, "show", "TB-9999")[0], 1)
         self.assertEqual(self.tb(self.wts[1], "claim", "--plan", plan)[0], 3)
         self.assertEqual(len(lines()), before + 1)

@@ -372,7 +372,9 @@ class Ctx:
         self.top = repo.top
         agent = "claude" if os.environ.get("CLAUDECODE") else (
             "codex" if any(k.startswith("CODEX") for k in os.environ) else os.environ.get("USER", "agent"))
-        self.owner = owner or os.environ.get("TASKBOARD_OWNER") or f"{agent}@{os.path.basename(self.top)}"
+        herdr = os.environ.get("HERDR_PANE_ID") if os.environ.get("HERDR_ENV") == "1" else None
+        self.owner = (owner or os.environ.get("TASKBOARD_OWNER") or (f"herdr:{herdr}" if herdr else None)
+                      or f"{agent}@{os.path.basename(self.top)}")
 
     def mutate(self, cmd: str, fn):
         """Lock, reread, apply fn(board) -> (output, event), validate, snapshot, write, log."""
@@ -390,10 +392,17 @@ class Ctx:
                      "reason": reason, **({"id": id} if id else {})}
             f.write(json.dumps(event) + "\n")
 
-    def own(self, it: Item, force: bool) -> None:
-        if it.get("worktree") != self.top and not force:
-            raise BoardError(f"{it.id} is held by {it.get('owner')} in {it.get('worktree')}, not this worktree "
-                             f"({self.top}); only with the user's go-ahead, rerun with --force")
+    def own(self, it: Item, force: bool) -> dict:
+        """Owner identity decides, not the worktree; the same owner in another worktree moves the task there."""
+        if it.get("owner") != self.owner and not force:
+            raise BoardError(f"{it.id} is held by {it.get('owner')} in {it.get('worktree')}, not by {self.owner}; "
+                             f"if you are that agent and moved worktrees, rerun with --owner {it.get('owner')}; "
+                             "otherwise only with the user's go-ahead, rerun with --force")
+        old = it.get("worktree")
+        if it.get("owner") != self.owner or old == self.top:
+            return {}
+        it.set("worktree", self.top)
+        return {"moved_from": old}
 
 
 def age(ts: str) -> tuple[str, float]:
@@ -482,10 +491,10 @@ def cmd_add(args, ctx: Ctx) -> int:
 
 def cmd_claim(args, ctx: Ctx) -> int:
     def fn(b: Board):
-        held = [i for i in b.items["In progress"] if i.get("worktree") == ctx.top and not i.blocked]
+        held = [i for i in b.items["In progress"] if i.get("owner") == ctx.owner and not i.blocked]
         if held:
-            raise BoardError(f"this worktree already works on {held[0].id}; complete, block or release it first "
-                             "(one unblocked task per worktree, use another worktree for parallel work)")
+            raise BoardError(f"{ctx.owner} already works on {held[0].id}; complete, block or release it first "
+                             "(one unblocked task per owner, use another --owner for parallel work)")
         if args.id:
             it = b.task_in(args.id, "Todo")
             if not b.ready(it):
@@ -520,7 +529,7 @@ def cmd_progress(args, ctx: Ctx) -> int:
 
     def fn(b: Board):
         it = b.task_in(args.id, "In progress")
-        ctx.own(it, args.force)
+        moved = ctx.own(it, args.force)
         if args.blocked:
             it.set("blocked", one_line(args.blocked))
             it.add_entry("Progress", f"blocked: {args.blocked}" if args.blocked != "none" else "unblocked", ctx.owner)
@@ -529,7 +538,7 @@ def cmd_progress(args, ctx: Ctx) -> int:
         if args.handoff:
             it.add_entry("Handoff", args.handoff, ctx.owner)
         it.set("updated_at", stamp())
-        return f"{it.id} updated", {"id": it.id, "note": args.blocked or args.note or args.handoff}
+        return f"{it.id} updated", {"id": it.id, "note": args.blocked or args.note or args.handoff, **moved}
     print(ctx.mutate("progress", fn))
     return 0
 
@@ -537,7 +546,7 @@ def cmd_progress(args, ctx: Ctx) -> int:
 def cmd_complete(args, ctx: Ctx) -> int:
     def fn(b: Board):
         it = b.task_in(args.id, "In progress")
-        ctx.own(it, args.force)
+        moved = ctx.own(it, args.force)
         for e in args.evidence:
             it.add_entry("Evidence", e, ctx.owner)
         it.drop("blocked")
@@ -545,7 +554,7 @@ def cmd_complete(args, ctx: Ctx) -> int:
         it.set("updated_at", stamp())
         b.move(it, "In progress", "Done")
         return f"{it.id} done. Next: claim --plan {it.get('plan')}", {
-            "id": it.id, "from": "In progress", "to": "Done", "note": "; ".join(args.evidence)}
+            "id": it.id, "from": "In progress", "to": "Done", "note": "; ".join(args.evidence), **moved}
     print(ctx.mutate("complete", fn))
     return 0
 
@@ -553,14 +562,14 @@ def cmd_complete(args, ctx: Ctx) -> int:
 def cmd_release(args, ctx: Ctx) -> int:
     def fn(b: Board):
         it = b.task_in(args.id, "In progress")
-        ctx.own(it, args.force)
+        moved = ctx.own(it, args.force)
         who = it.get("owner")
         note = args.handoff if who == ctx.owner else f"(released from {who}) {args.handoff}"
         it.add_entry("Handoff", note, ctx.owner)
         it.drop("owner", "worktree", "claimed_at", "blocked")
         it.set("updated_at", stamp())
         b.move(it, "In progress", "Todo", top=True)
-        return f"{it.id} back on top of Todo", {"id": it.id, "from": "In progress", "to": "Todo", "note": note}
+        return f"{it.id} back on top of Todo", {"id": it.id, "from": "In progress", "to": "Todo", "note": note, **moved}
     print(ctx.mutate("release", fn))
     return 0
 
@@ -570,15 +579,14 @@ def cmd_close(args, ctx: Ctx) -> int:
         src, it = b.find(args.id)
         if src not in ("Todo", "In progress"):
             raise BoardError(f"{it.id} is in '{src}', not 'Todo' or 'In progress'")
-        if src == "In progress":
-            ctx.own(it, args.force)
+        moved = ctx.own(it, args.force) if src == "In progress" else {}
         note = f"closed: {args.reason}"
         it.add_entry("Evidence", note, ctx.owner)
         it.drop("owner", "worktree", "claimed_at", "blocked")
         it.set("closed_at", stamp())
         it.set("updated_at", stamp())
         b.move(it, src, "Done")
-        return f"{it.id} closed", {"id": it.id, "from": src, "to": "Done", "note": note}
+        return f"{it.id} closed", {"id": it.id, "from": src, "to": "Done", "note": note, **moved}
     print(ctx.mutate("close", fn))
     return 0
 
@@ -608,7 +616,7 @@ def cmd_restore(args, ctx: Ctx) -> int:
 def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="taskboard", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--owner", help="label for claims (default: $TASKBOARD_OWNER or <agent>@<worktree>)")
+    p.add_argument("--owner", help="identity for claims and ownership (default: $TASKBOARD_OWNER, else herdr:$HERDR_PANE_ID in Herdr, else <agent>@<worktree>)")
     sub = p.add_subparsers(dest="cmd", required=True, metavar="command")
 
     def cmd(name, fn, help_):
@@ -631,7 +639,7 @@ def parser() -> argparse.ArgumentParser:
     s.add_argument("--outcome", required=True, help="what is true when the task is done")
     s.add_argument("--done-when", required=True, action="append", help="checkable criterion (repeatable)")
     s.add_argument("--depends-on", help="comma separated task ids from the same plan")
-    s = cmd("claim", cmd_claim, "claim the first eligible task (or ID) for this worktree and print it")
+    s = cmd("claim", cmd_claim, "claim the first eligible task (or ID) for your owner and print it")
     s.add_argument("id", nargs="?")
     s.add_argument("--plan")
     s = cmd("progress", cmd_progress, "record progress, a blocker (--blocked none clears it) or a handoff note")
@@ -639,19 +647,19 @@ def parser() -> argparse.ArgumentParser:
     s.add_argument("--note")
     s.add_argument("--blocked")
     s.add_argument("--handoff")
-    s.add_argument("--force", action="store_true", help="act on another worktree's task (user-directed only)")
+    s.add_argument("--force", action="store_true", help="act on another owner's task (user-directed only)")
     s = cmd("complete", cmd_complete, "move a task to Done with evidence (commit, PR, path, checks run)")
     s.add_argument("id")
     s.add_argument("--evidence", required=True, action="append", help="repeatable; one bullet each")
-    s.add_argument("--force", action="store_true", help="act on another worktree's task (user-directed only)")
+    s.add_argument("--force", action="store_true", help="act on another owner's task (user-directed only)")
     s = cmd("release", cmd_release, "return a task to the top of Todo with a handoff note")
     s.add_argument("id")
     s.add_argument("--handoff", required=True)
-    s.add_argument("--force", action="store_true", help="release another worktree's task (user-directed only)")
+    s.add_argument("--force", action="store_true", help="release another owner's task (user-directed only)")
     s = cmd("close", cmd_close, "move a Todo or In progress task to Done as closed (superseded, dropped) with a reason")
     s.add_argument("id")
     s.add_argument("--reason", required=True)
-    s.add_argument("--force", action="store_true", help="close another worktree's task (user-directed only)")
+    s.add_argument("--force", action="store_true", help="close another owner's task (user-directed only)")
     s = cmd("restore", cmd_restore, "list backups, or restore one by name or path")
     s.add_argument("backup", nargs="?")
     return p
