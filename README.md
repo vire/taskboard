@@ -20,6 +20,8 @@ npx skills add vire/taskboard
 git clone https://github.com/vire/taskboard ~/code/taskboard
 ln -s ~/code/taskboard/skills/taskboard ~/.agents/skills/taskboard
 ln -s ~/code/taskboard/skills/taskboard ~/.claude/skills/taskboard
+ln -s ~/code/taskboard/skills/retro ~/.agents/skills/taskboard-retro    # optional retro skill
+ln -s ~/code/taskboard/skills/retro ~/.claude/skills/taskboard-retro
 ```
 
 ## Use
@@ -75,6 +77,17 @@ A refused state-changing command adds a line with `"exit": 1` and its `reason`. 
 ```sh
 tail -n 20 .taskboard/log.jsonl
 ```
+
+## Retrospective
+
+The companion `retro` skill (`taskboard:retro` as a plugin) reviews how a board went over a time window. Its helper only reads, and prints the facts the report is built from: events per command and owner, refusals by reason, owner gate latency, idle-ready gaps, open tasks whose text names a PR that is already merged, and every PR referenced. It reads logs from before and after typed waits.
+
+```sh
+python3 ~/code/taskboard/skills/retro/retro.py --since 2026-10-03 --until 2026-10-04T19:00Z
+python3 ~/code/taskboard/skills/retro/retro.py --log copy/log.jsonl --board copy/board.md   # any copy
+```
+
+The skill turns that output into a report (TL;DR, what went well, problems table, ranked recommendations), can cross-check PRs with `gh`, and asks a second model to challenge the draft when one is reachable. It saves the report to `.taskboard/retro-<date>.md`.
 
 ## Configuration
 
