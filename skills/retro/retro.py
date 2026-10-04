@@ -102,7 +102,7 @@ def gates(events: list[dict]) -> list[dict]:
             typed = True
             kind = str(e.get("waiting_on", "")).replace("coordinator", "owner")
             if kind in GATE_KINDS:
-                start(tid, kind, e["blocked"].splitlines()[0], when(e.get("gate_since") or e["ts"]))
+                start(tid, kind, e["blocked"].splitlines()[0], at)  # gate_since here may be the replaced gate's
             else:
                 close(tid, at)
         elif e["cmd"] in ("complete", "release", "close"):

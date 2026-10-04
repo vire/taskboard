@@ -96,6 +96,17 @@ class RetroTest(unittest.TestCase):
         self.assertEqual(self.row(out, "| TB-0001 |")[-1], "2.5")
         self.assertNotIn("| TB-0002 |", out)
 
+    def test_a_gate_replaced_by_another_starts_when_the_new_one_is_set(self):
+        since = lambda t: f"2026-10-03T{t}:00Z"
+        out = self.run_retro([
+            ev("07:00", "progress", "TB-0001", blocked="awaiting owner: merge #12", waiting_on="owner", gate_since=since("07:00")),
+            ev("08:00", "progress", "TB-0001", blocked="awaiting reader: restore", waiting_on="reader",
+               gate_since=since("07:00"), gate_cleared_at=since("08:00")),  # still open: its own start is the event ts
+        ])
+        rows = [[c.strip() for c in l.strip("|").split("|")] for l in out.splitlines() if l.startswith("| TB-0001 |")]
+        self.assertEqual([(r[1], r[3], r[4]) for r in rows], [("owner", since("07:00"), since("08:00")),
+                                                              ("reader", since("08:00"), "open")])
+
     def test_idle_ready_gap_needs_ready_work_and_silence(self):
         out = self.run_retro([
             ev("07:00", "add", "TB-0001", to="Todo"),
