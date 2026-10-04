@@ -46,6 +46,8 @@ WAIT = re.compile(r"^(?:awaiting\s+)?(owner|coordinator|reader|decision|ci|bot|r
                   re.I)
 GATES = ("owner", "reader", "decision")  # waits only a human can clear; list shows them as blocked
 GATE_LINES = ("after", "cmd", "due")  # optional lines under a --blocked reason, stored as fields
+FIELDS = ("due", "linear", "prs", "step")  # optional task fields set with --set key=value
+FOLLOW_UP = re.compile(r"left to|follow[- ]?up|\bTODO\b", re.I)
 PR_REF = re.compile(r"(?:#|\bPR\s*#?)(\d{2,})\b")
 MERGED = re.compile(r"(?:#|\bPR\s*#?)(\d{2,})\b(?:\s+is)?\s+\(?merged\b(?!\s+(?:origin/)?main\b|\s+with\b)", re.I)
 EXIT_ERROR, EXIT_NOTHING, EXIT_ATTENTION, EXIT_BUSY = 1, 3, 4, 75
@@ -82,17 +84,20 @@ def git(*args: str) -> list[str]:
     return r.stdout.splitlines()
 
 
-def text_lines(text: str) -> list[str]:
+def lines_of(text: str) -> list[str]:
     lines = [line.rstrip() for line in text.strip().splitlines()]
     if not lines:
         raise BoardError("empty text")
-    if any(line.startswith("#") for line in lines):
-        raise BoardError("task text may not have lines starting with '#'; they would break the board structure")
     return lines
 
 
+def text_lines(text: str) -> list[str]:
+    """For raw Markdown blocks (outcome, plan body): a line starting with '#' is escaped so it stays text."""
+    return ["\\" + line if line.startswith("#") else line for line in lines_of(text)]
+
+
 def one_line(text: str) -> str:
-    lines = text_lines(text)
+    lines = lines_of(text)
     if len(lines) > 1:
         raise BoardError("titles must be a single line")
     return lines[0]
@@ -165,6 +170,21 @@ class Item:
         self.drop("blocked", "gate_since", "after", "cmd")
         return {"gate_since": since, "gate_cleared_at": stamp()} if since else {}
 
+    def replace(self, sub: str, lines: list[str]) -> None:
+        """Replace the body of `#### sub`, creating the subsection if needed."""
+        if f"#### {sub}" not in self.lines:
+            self.lines += ["", f"#### {sub}", *lines]
+            return
+        start = self.lines.index(f"#### {sub}") + 1
+        end = start + len(self.section(sub))
+        self.lines[start:end] = lines + ([""] if end < len(self.lines) else [])
+
+    def facts(self) -> dict:
+        """What edit can change, for its log entry."""
+        return {"title": self.title, "outcome": self.section("Outcome"), "depends_on": self.get("depends_on"),
+                "done_when": [line[2:] for line in self.section("Done when") if line.startswith("- ")],
+                **{k: self.get(k) for k in FIELDS}}
+
     def section(self, sub: str) -> list[str]:
         """Lines under `#### sub`, up to the next subsection."""
         if f"#### {sub}" not in self.lines:
@@ -178,7 +198,7 @@ class Item:
 
     def add_entry(self, sub: str, text: str, who: str) -> None:
         """Append a timestamped bullet under `#### sub`, creating the subsection if needed."""
-        first, *rest = text_lines(text)
+        first, *rest = lines_of(text)  # prefixed and indented, so '#' lines are safe as they are
         new = [f"- {stamp()} {who}: {first}"] + [f"  {line}".rstrip() for line in rest]
         head = f"#### {sub}"
         if head not in self.lines:
@@ -255,6 +275,8 @@ class Board:
             plan = it.get("plan")
             if plan not in seen or not plan.startswith("P-"):
                 raise BoardError(f"board.md:{it.lineno}: {it.id} has unknown plan '{plan}'")
+            if it.id in it.deps:
+                raise BoardError(f"board.md:{it.lineno}: {it.id} cannot depend on itself")
             for d in it.deps:
                 if d not in seen or not d.startswith("TB-"):
                     raise BoardError(f"board.md:{it.lineno}: {it.id} depends on unknown task '{d}'")
@@ -556,28 +578,78 @@ def cmd_plan(args, r: Repo) -> str:
     return r.mutate("plan", fn)
 
 
+def new_task(b: Board, title: str, plan: str, outcome: str, done_when: list[str], deps: str | None = None) -> Item:
+    if b.find(plan)[0] != "Plans":
+        raise BoardError(f"{plan} is not a plan")
+    deps = ", ".join(d.strip() for d in (deps or "").split(",") if d.strip())
+    tid = b.next_id("TB-", 4)
+    lines = [f"### {tid} - {one_line(title)}", f"- plan: {plan}"] + ([f"- depends_on: {deps}"] if deps else [])
+    lines += ["", "#### Outcome", *text_lines(outcome), "", "#### Done when", *(f"- {one_line(c)}" for c in done_when)]
+    b.items["Todo"].append(Item(lines))
+    return b.items["Todo"][-1]
+
+
+def set_fields(it: Item, pairs: list[str] | None) -> None:
+    for pair in pairs or []:
+        key, sep, value = pair.partition("=")
+        if not sep or key not in FIELDS:
+            raise BoardError(f"--set takes key=value with key one of {', '.join(FIELDS)}; got '{pair}'")
+        if value.strip() in ("", "none"):
+            it.drop(key)
+            continue
+        if key == "due":
+            gate_line(f"due: {value}")
+        it.set(key, one_line(value))
+
+
 def cmd_add(args, r: Repo) -> str:
     def fn(b: Board):
-        if b.find(args.plan)[0] != "Plans":
-            raise BoardError(f"{args.plan} is not a plan")
-        deps = [d.strip() for d in (args.depends_on or "").split(",") if d.strip()]
-        tid = b.next_id("TB-", 4)
-        lines = [f"### {tid} - {one_line(args.title)}", f"- plan: {args.plan}"]
-        if deps:
-            lines.append(f"- depends_on: {', '.join(deps)}")
-        lines += ["", "#### Outcome", *text_lines(args.outcome), "", "#### Done when"]
-        lines += [f"- {one_line(c)}" for c in args.done_when]
-        b.items["Todo"].append(Item(lines))
-        return tid, {"id": tid, "to": "Todo"}
+        it = new_task(b, args.title, args.plan, args.outcome, args.done_when, args.depends_on)
+        set_fields(it, args.set)
+        return it.id, {"id": it.id, "to": "Todo"}
     return r.mutate("add", fn)
+
+
+def cmd_note(args, r: Repo) -> str:
+    def fn(b: Board):
+        _, it = b.find(args.id)
+        it.add_entry("Progress", args.text, r.owner)
+        return f"{it.id} noted", {"id": it.id, "note": args.text}
+    return r.mutate("note", fn)
+
+
+def cmd_edit(args, r: Repo) -> str:
+    def fn(b: Board):
+        section, it = b.find(args.id)
+        if section not in ("Todo", "In progress"):
+            raise BoardError(f"{it.id} is in '{section}'; only Todo and In progress tasks can be edited, use note")
+        if section == "In progress":
+            r.own(it, args.force)
+        old = it.facts()
+        if args.title:
+            it.title = one_line(args.title)
+            it.lines[0] = f"### {it.id} - {it.title}"
+        if args.outcome:
+            it.replace("Outcome", text_lines(args.outcome))
+        if args.done_when:
+            it.replace("Done when", [f"- {one_line(c)}" for c in args.done_when])
+        if args.depends_on in ("none", ""):
+            it.drop("depends_on")
+        elif args.depends_on:
+            it.set("depends_on", ", ".join(d.strip() for d in args.depends_on.split(",") if d.strip()))
+        set_fields(it, args.set)
+        new = it.facts()
+        changed = [k for k in old if old[k] != new[k]]
+        return f"{it.id} edited", {"id": it.id, "old": {k: old[k] for k in changed}, "new": {k: new[k] for k in changed}}
+    return r.mutate("edit", fn)
 
 
 def cmd_claim(args, r: Repo) -> str:
     def fn(b: Board):
-        held = [i for i in b.items["In progress"] if i.get("owner") == r.owner and not i.blocked]
-        if held:
-            raise BoardError(f"{r.owner} already works on {held[0].id}; complete, block or release it first "
-                             "(one unblocked task per owner, use another --owner for parallel work)")
+        held = [i.id for i in b.items["In progress"] if i.get("owner") == r.owner and i.status != "blocked"]
+        if len(held) >= args.wip:
+            raise BoardError(f"{r.owner} already works on {', '.join(held)} (WIP limit {args.wip}; owner, reader and "
+                             "decision gates do not count); complete one, gate it, release it, or use another --owner")
         if args.id:
             it = b.task_in(args.id, "Todo")
             if b.waiting(it):
@@ -614,7 +686,7 @@ def cmd_progress(args, r: Repo) -> str:
         r.own(it, args.force)
         event = {"id": it.id, "note": args.note, "handoff": args.handoff}
         if args.blocked:
-            reason, *rest = text_lines(args.blocked)
+            reason, *rest = lines_of(args.blocked)
             lines = dict(gate_line(line) for line in rest)
             if reason == it.blocked:
                 it.drop("after", "cmd")
@@ -655,12 +727,21 @@ def cmd_complete(args, r: Repo) -> str:
         r.own(it, args.force)
         for e in args.evidence:
             it.add_entry("Evidence", e, r.owner)
+        spawned = [new_task(b, t, it.get("plan"), f"Follow-up of {it.id}: {one_line(t)}",
+                            ["the follow-up in the title is done"]).id for t in args.spawn or []]
+        if spawned:
+            it.set("spawned", ", ".join(spawned))
+        if args.cleanup:
+            it.set("cleanup", one_line(args.cleanup))
         gate = it.unblock()
         it.set("completed_at", stamp())
         it.set("updated_at", stamp())
         b.move(it, "In progress", "Done")
-        return f"{it.id} done. Next: claim --plan {it.get('plan')}", {
-            "id": it.id, "from": "In progress", "to": "Done", "note": "; ".join(args.evidence), **gate}
+        out = f"{it.id} done" + (f", spawned {', '.join(spawned)}" if spawned else "") + f". Next: claim --plan {it.get('plan')}"
+        if not spawned and FOLLOW_UP.search(" ".join(args.evidence)):
+            out += "\nwarning: the evidence mentions a follow-up but none was spawned; add it as a task (add, or --spawn next time)"
+        return out, {"id": it.id, "from": "In progress", "to": "Done", "note": "; ".join(args.evidence),
+                     **({"spawned": spawned} if spawned else {}), **gate}
     return r.mutate("complete", fn)
 
 
@@ -739,9 +820,22 @@ def parser() -> argparse.ArgumentParser:
     s.add_argument("--outcome", required=True, help="what is true when the task is done")
     s.add_argument("--done-when", required=True, action="append", help="checkable criterion (repeatable)")
     s.add_argument("--depends-on", help="comma separated task ids from the same plan")
+    s.add_argument("--set", action="append", metavar="KEY=VALUE", help=f"optional field, one of {', '.join(FIELDS)} (repeatable)")
+    s = cmd("note", cmd_note, "append a fact to any task or plan, by anyone; changes no state")
+    s.add_argument("id")
+    s.add_argument("text")
+    s = cmd("edit", cmd_edit, "rewrite a Todo or In progress task's title, outcome, done-when, dependencies or fields")
+    s.add_argument("id")
+    s.add_argument("--title")
+    s.add_argument("--outcome")
+    s.add_argument("--done-when", action="append", help="replaces all criteria (repeatable)")
+    s.add_argument("--depends-on", help="comma separated task ids, or none")
+    s.add_argument("--set", action="append", metavar="KEY=VALUE", help=f"one of {', '.join(FIELDS)}; VALUE none clears it")
+    s.add_argument("--force", action="store_true", help="edit another owner's task (user-directed only)")
     s = cmd("claim", cmd_claim, "claim the first eligible task (or ID) for your owner and print it")
     s.add_argument("id", nargs="?")
     s.add_argument("--plan")
+    s.add_argument("--wip", type=int, default=2, help="most doing or waiting tasks per owner (default 2); gates do not count")
     s = cmd("progress", cmd_progress, "record progress, a blocker (--blocked none clears it) or a handoff note")
     s.add_argument("id")
     s.add_argument("--note")
@@ -752,6 +846,8 @@ def parser() -> argparse.ArgumentParser:
     s = cmd("complete", cmd_complete, "move a task to Done with evidence (commit, PR, path, checks run)")
     s.add_argument("id")
     s.add_argument("--evidence", required=True, action="append", help="repeatable; one bullet each")
+    s.add_argument("--spawn", action="append", metavar="TITLE", help="add a follow-up task to the same plan (repeatable)")
+    s.add_argument("--cleanup", help="what happened to the worktree, e.g. 'removed' or 'kept: PR 12 open'")
     s.add_argument("--force", action="store_true", help="act on another owner's task (user-directed only)")
     s = cmd("release", cmd_release, "return a task to the top of Todo with a handoff note")
     s.add_argument("id")
