@@ -36,6 +36,8 @@ To check the board yourself:
 python3 .taskboard/tb list            # plans and open tasks, one line each
 python3 .taskboard/tb list --all      # including done
 python3 .taskboard/tb show TB-0003    # one task in full
+python3 .taskboard/tb gates           # the owner's queue in merge order, with commands
+python3 .taskboard/tb list --check    # problems only, exit 4 if any (for a cron watchdog)
 python3 .taskboard/tb --help
 ```
 
@@ -46,6 +48,7 @@ python3 .taskboard/tb --help
 - **Storage.** `<git-common-dir>/taskboard/board.md` holds four sections: `## Plans`, `## Todo`, `## In progress`, `## Done`. The section a task sits in is its status. All worktrees of a clone share one board; separate clones have separate boards.
 - **Tasks.** Each task is a `### TB-0001 - Title` block. Below the heading come `- key: value` fields (`plan`, `depends_on`, `owner`, `worktree`, `claimed_at`, `blocked`, ...), followed by `#### Outcome`, `#### Done when`, `#### Progress`, `#### Handoff` and `#### Evidence`.
 - **Claims.** `claim` takes the first task in Todo order whose dependencies are all done. A task belongs to its owner label, and each owner holds at most one unblocked task. The default owner is `herdr:<pane id>` inside Herdr, else `<agent>@<worktree name>`, so nothing has to be remembered between agent turns. Give agents distinct owners (`--owner`, `$TASKBOARD_OWNER`) and several can share one checkout; a task follows its owner to another worktree. Acting on another owner's task needs `--force`, which the skill reserves for user instructions.
+- **Waits and gates.** `progress --blocked` takes a typed first line. `awaiting owner|reader|decision: ...` is a gate: `list` shows it as `blocked`, `gates` lists it in `after:` order with its `cmd:`, and the log records `gate_since` and `gate_cleared_at`. `awaiting ci|bot|review|pr:N|task:TB-x` and `paused` show as `waiting`. Untyped text still reads as `blocked`, so older boards need no migration.
 - **Closing.** `close ID --reason` moves a task to Done marked `closed` (superseded by an external ticket, dropped). Dependents treat it like a done task.
 - **Concurrency.** Every write takes one `flock`, rereads and validates the board, applies the change, and replaces `board.md` atomically (temp file, fsync, `os.replace`). A crash leaves either the old board or the new one. Reads take no lock. If the lock stays busy for 10 s, the command exits `75`.
 - **Hand edits.** You can edit `board.md` by hand while no agent is writing. The next command validates the file and refuses to continue on errors, naming the line, such as an unknown section, a duplicate id, a missing plan or dependency, or a cycle. Edits made while agents write are last-writer-wins.
@@ -99,7 +102,7 @@ v1 departs from its original plan (four board files, a `pending.json` intent rec
 - **One `board.md` instead of `index.md`, `todo.md`, `inprogress.md` and `done.md`.** Moving a task becomes one atomic file replace, so the `pending.json` intent record and the recovery pass are not needed.
 - **The helper lives in the installed skill only.** No copy goes inside each board, so one version is used everywhere.
 - **Ownership is an owner label, not a claim token.** A token stored in plaintext on the board protects nothing, and agents would have to carry it across turns. v1 tied ownership to the worktree; real use showed agents moving to a fresh worktree after claiming and several read-only agents sharing one checkout, so ownership moved to the owner label.
-- **Expiry is a `!stale` flag in `list`** for claims older than 24 h, and `!quiet` marks doing tasks silent for 30 min. There are no `expires_at`, `renew` or `sweep` commands. A takeover is `release --force` with a handoff note.
+- **Expiry is a `!stale` flag in `list`** for tasks without an update for 24 h, `!quiet` marks doing tasks silent for 30 min, and `!gate` marks human gates open over 4 h. There are no `expires_at`, `renew` or `sweep` commands. A takeover is `release --force` with a handoff note.
 - **No `edit` command that holds the lock.** Hand edits are validated on the next command instead.
 
 ## Development
