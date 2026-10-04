@@ -11,6 +11,7 @@ import argparse
 import contextlib
 import datetime as dt
 import fcntl
+import graphlib
 import hashlib
 import json
 import os
@@ -36,19 +37,30 @@ Shared by every worktree of this clone. Change it through the helper
 SECTIONS = ("Plans", "Todo", "In progress", "Done")
 KEEP_BACKUPS = 30
 LOCK_WAIT_S = 10.0
-TTL_HOURS = 24  # claims older than this show !stale in list
+TTL_HOURS = 24  # tasks without an update for longer show !stale in list
 QUIET_MIN = 30  # doing tasks silent for longer show !quiet in list
+GATE_HOURS = 4  # owner, reader and decision gates open for longer show !gate in list
 HEAD = re.compile(r"^### ((?:TB|P)-\d+) - (\S.*)$")
 FIELD = re.compile(r"^- ([a-z_]+):(.*)$")
-EXIT_ERROR, EXIT_NOTHING, EXIT_BUSY = 1, 3, 75
+WAIT = re.compile(r"^(?:awaiting\s+)?(owner|coordinator|reader|decision|ci|bot|review|paused|pr:\s*#?\d+|task:\s*TB-\d+)\b:?\s*",
+                  re.I)
+GATES = ("owner", "reader", "decision")  # waits only a human can clear; list shows them as blocked
+GATE_LINES = ("after", "cmd", "due")  # optional lines under a --blocked reason, stored as fields
+PR_REF = re.compile(r"(?:#|\bPR\s*#?)(\d{2,})\b")
+MERGED = re.compile(r"(?:#|\bPR\s*#?)(\d{2,})\b(?:\s+is)?\s+\(?merged\b(?!\s+(?:origin/)?main\b|\s+with\b)", re.I)
+EXIT_ERROR, EXIT_NOTHING, EXIT_ATTENTION, EXIT_BUSY = 1, 3, 4, 75
 
 
 class BoardError(Exception):
     pass
 
 
-class NothingEligible(BoardError):
-    pass
+class Notice(BoardError):
+    """Not an error: printed on stdout, not logged, exits with its own code."""
+
+    def __init__(self, text: str, code: int):
+        super().__init__(text)
+        self.code = code
 
 
 class Busy(BoardError):
@@ -130,6 +142,39 @@ class Item:
     @property
     def blocked(self) -> str:
         return "" if self.get("blocked") in ("", "none") else self.get("blocked")
+
+    @property
+    def waiting_on(self) -> str:
+        """Type of the blocker, read from its text so older boards need no migration; 'blocked' if untyped."""
+        m = WAIT.match(self.blocked)
+        if not m:
+            return "blocked" if self.blocked else ""
+        kind, _, ref = m.group(1).partition(":")
+        kind = "owner" if kind.lower() == "coordinator" else kind.lower()
+        return f"{kind}:{ref.strip().lstrip('#')}" if ref else kind
+
+    @property
+    def status(self) -> str:
+        """In progress only: doing, waiting (on an agent-side wait) or blocked (on a human or untyped)."""
+        kind = self.waiting_on
+        return "doing" if not kind else "blocked" if kind in (*GATES, "blocked") else "waiting"
+
+    def unblock(self) -> dict:
+        """Drop the blocker and its gate lines; the returned log keys measure how long the gate was open."""
+        since = self.get("gate_since")
+        self.drop("blocked", "gate_since", "after", "cmd")
+        return {"gate_since": since, "gate_cleared_at": stamp()} if since else {}
+
+    def section(self, sub: str) -> list[str]:
+        """Lines under `#### sub`, up to the next subsection."""
+        if f"#### {sub}" not in self.lines:
+            return []
+        rest = self.lines[self.lines.index(f"#### {sub}") + 1:]
+        return rest[:next((n for n, line in enumerate(rest) if line.startswith("#### ")), len(rest))]
+
+    def claims(self) -> str:
+        """The parts of a task that go stale: its done-when criteria, blocker and gate command."""
+        return "\n".join([*self.section("Done when"), self.blocked, self.get("cmd")])
 
     def add_entry(self, sub: str, text: str, who: str) -> None:
         """Append a timestamped bullet under `#### sub`, creating the subsection if needed."""
@@ -256,6 +301,13 @@ class Board:
         # ponytail: max+1, so hand-deleting the newest task frees its id again; keep a counter if that bites
         nums = [int(i.id.split("-")[1]) for items in self.items.values() for i in items if i.id.startswith(prefix)]
         return f"{prefix}{max(nums, default=0) + 1:0{width}d}"
+
+    def idle_ready(self, plan: str) -> list[str]:
+        """Ready Todo tasks of a plan that nobody is doing. Proposals are never claimed, so never idle."""
+        doing = any(i.status == "doing" for i in self.items["In progress"] if i.get("plan") == plan)
+        if doing or self.find(plan)[1].title == "Proposals":
+            return []
+        return [i.id for i in self.items["Todo"] if i.get("plan") == plan and not self.waiting(i)]
 
     def waiting(self, it: Item) -> list[str]:
         done = {i.id for i in self.items["Done"]}
@@ -403,11 +455,16 @@ def row(board: Board, section: str, it: Item) -> str:
         waiting = board.waiting(it)
         status, extra = ("waiting", f"needs {','.join(waiting)}") if waiting else ("ready", "")
     elif section == "In progress":
-        claimed, hours = age(it.get("claimed_at"))
+        status = it.status
         label, idle = age(it.get("updated_at") or it.get("claimed_at"))
-        status = "blocked" if it.blocked else "doing"
-        quiet = not it.blocked and idle * 60 > QUIET_MIN
-        extra = f"{it.get('owner')} {label}" + (f" !stale {claimed}" if hours > TTL_HOURS else "") + (" !quiet" if quiet else "")
+        extra = f"{it.get('owner')} {label}"
+        if it.waiting_on in GATES:
+            gate, hours = age(it.get("gate_since") or it.get("updated_at"))
+            extra += f" !gate {gate}" if hours > GATE_HOURS else ""
+        elif idle > TTL_HOURS:
+            extra += " !stale"
+        elif status == "doing" and idle * 60 > QUIET_MIN:
+            extra += " !quiet"
         if it.blocked:
             extra += f" ({it.blocked})"
     else:
@@ -427,13 +484,62 @@ def cmd_list(args, r: Repo) -> str:
         for p in board.items["Plans"]:
             counts = {s: sum(1 for i in board.items[s] if i.get("plan") == p.id) for s in SECTIONS[1:]}
             out.append(f"{p.id:<8} plan     {counts['Todo']} todo, {counts['In progress']} in progress, "
-                       f"{counts['Done']} done  {p.title}")
+                       f"{counts['Done']} done  {p.title}" + ("  [!idle-ready]" if board.idle_ready(p.id) else ""))
     elif args.plan not in {p.id for p in board.items["Plans"]}:
         raise BoardError(f"no such plan {args.plan}")
+    if args.check:
+        return check(board)
     for section, it in board.tasks():
         if (args.all or section != "Done") and args.plan in (None, it.get("plan")):
             out.append(row(board, section, it))
     return "\n".join(out) if out else "board is empty; create a plan with: plan \"Title\" --body \"...\""
+
+
+def check(b: Board) -> str:
+    """Problems a watchdog should raise; the last line always proves the board was read."""
+    open_ = [(s, i) for s, i in b.tasks() if s != "Done"]
+    today = utcnow().date().isoformat()
+    out = [f"!due {i.id} is past due {i.get('due')} ({i.blocked or s})" for s, i in open_ if i.get("due") and i.get("due") < today]
+    out += [f"!idle-ready {p.id} has ready {', '.join(b.idle_ready(p.id))} and nobody doing" for p in b.items["Plans"]
+            if b.idle_ready(p.id)]
+    merged = {n for items in b.items.values() for i in items for line in i.lines for n in MERGED.findall(line)}
+    merged |= {n for i in b.items["Done"] for line in i.section("Evidence") for n in PR_REF.findall(line)}
+    out += [f"!stale-text {i.id} names #{n}, marked merged or done; update it with a note" for _, i in open_
+            for n in sorted(set(PR_REF.findall(i.claims())) & merged)]
+    gates = sum(1 for _, i in open_ if i.waiting_on in GATES)
+    out.append(f"check: scanned {len(open_)} open tasks, {gates} gates, {len(b.items['Plans'])} plans at {stamp()}; "
+               f"{len(out)} problems")
+    if len(out) > 1:
+        raise Notice("\n".join(out), EXIT_ATTENTION)
+    return out[0]
+
+
+def cmd_gates(args, r: Repo) -> str:
+    b = Board(r.read())
+    gates = {i.id: i for s, i in b.tasks() if s == "In progress" and i.waiting_on in GATES and args.plan in (None, i.get("plan"))}
+
+    def names(it: Item, ref: str) -> bool:
+        return ref == it.id or bool(re.search(rf"(?<!\d){ref.lstrip('#')}(?!\d)", f"{it.blocked} {it.get('cmd')}"))
+
+    graph = {tid: {o for ref in re.findall(r"#\d+|TB-\d+", it.get("after")) for o, other in gates.items()
+                   if o != tid and names(other, ref)} for tid, it in gates.items()}
+    order = graphlib.TopologicalSorter(graph)
+    try:
+        order.prepare()
+    except graphlib.CycleError as e:
+        raise BoardError(f"gate order cycle: {' -> '.join(e.args[1])}") from None
+    ids = []
+    while order.is_active():  # oldest gate first among those whose 'after' gates are listed
+        ready = sorted(order.get_ready(), key=lambda t: (gates[t].get("gate_since") or gates[t].get("updated_at"), t))
+        order.done(*ready)
+        ids += ready
+    out = []
+    for n, it in enumerate((gates[t] for t in ids), 1):
+        label, _ = age(it.get("gate_since") or it.get("updated_at"))
+        due = f", due {it.get('due')}" if it.get("due") else ""
+        out.append(f"{n}. [{it.waiting_on} {label}{due}] {WAIT.sub('', it.blocked)} - {it.id} {it.get('plan')} {it.get('owner')}")
+        out += [f"   {k}: {it.get(k)}" for k in ("after", "cmd") if it.get(k)]
+    return "\n".join(out) if out else "no open gates"
 
 
 def cmd_show(args, r: Repo) -> str:
@@ -475,12 +581,12 @@ def cmd_claim(args, r: Repo) -> str:
         if args.id:
             it = b.task_in(args.id, "Todo")
             if b.waiting(it):
-                raise NothingEligible(f"{it.id} still waits on {', '.join(b.waiting(it))}")
+                raise Notice(f"{it.id} still waits on {', '.join(b.waiting(it))}", EXIT_NOTHING)
         else:
             todo = [i for i in b.items["Todo"] if args.plan in (None, i.get("plan"))]
             it = next((i for i in todo if not b.waiting(i)), None)
             if it is None:
-                raise NothingEligible(why_nothing(b, args.plan))
+                raise Notice(why_nothing(b, args.plan), EXIT_NOTHING)
         it.set("owner", r.owner)
         it.set("worktree", r.top)
         it.set("claimed_at", stamp())
@@ -506,16 +612,41 @@ def cmd_progress(args, r: Repo) -> str:
     def fn(b: Board):
         it = b.task_in(args.id, "In progress")
         r.own(it, args.force)
+        event = {"id": it.id, "note": args.note, "handoff": args.handoff}
         if args.blocked:
-            it.set("blocked", one_line(args.blocked))
+            reason, *rest = text_lines(args.blocked)
+            lines = dict(gate_line(line) for line in rest)
+            if reason == it.blocked:
+                it.drop("after", "cmd")
+            else:
+                event.update(it.unblock())
+            it.set("blocked", reason)
+            for k, v in lines.items():
+                it.set(k, v)
+            if it.waiting_on in GATES and not it.get("gate_since"):
+                it.set("gate_since", stamp())
+                event.setdefault("gate_since", it.get("gate_since"))
+            event.update(blocked=reason, waiting_on=it.waiting_on or "none")
             it.add_entry("Progress", f"blocked: {args.blocked}" if args.blocked != "none" else "unblocked", r.owner)
         if args.note:
             it.add_entry("Progress", args.note, r.owner)
         if args.handoff:
             it.add_entry("Handoff", args.handoff, r.owner)
         it.set("updated_at", stamp())
-        return f"{it.id} updated", {"id": it.id, "note": args.blocked or args.note or args.handoff}
+        return f"{it.id} updated", {k: v for k, v in event.items() if v}
     return r.mutate("progress", fn)
+
+
+def gate_line(line: str) -> tuple[str, str]:
+    key, sep, value = line.partition(":")
+    if not sep or key.strip() not in GATE_LINES:
+        raise BoardError(f"--blocked takes a reason line, then only {', '.join(k + ':' for k in GATE_LINES)} lines; got '{line}'")
+    if key.strip() == "due":
+        try:
+            dt.date.fromisoformat(value.strip())
+        except ValueError:
+            raise BoardError(f"due: wants a date like 2026-10-09, got '{value.strip()}'") from None
+    return key.strip(), value.strip()
 
 
 def cmd_complete(args, r: Repo) -> str:
@@ -524,12 +655,12 @@ def cmd_complete(args, r: Repo) -> str:
         r.own(it, args.force)
         for e in args.evidence:
             it.add_entry("Evidence", e, r.owner)
-        it.drop("blocked")
+        gate = it.unblock()
         it.set("completed_at", stamp())
         it.set("updated_at", stamp())
         b.move(it, "In progress", "Done")
         return f"{it.id} done. Next: claim --plan {it.get('plan')}", {
-            "id": it.id, "from": "In progress", "to": "Done", "note": "; ".join(args.evidence)}
+            "id": it.id, "from": "In progress", "to": "Done", "note": "; ".join(args.evidence), **gate}
     return r.mutate("complete", fn)
 
 
@@ -540,10 +671,11 @@ def cmd_release(args, r: Repo) -> str:
         who = it.get("owner")
         note = args.handoff if who == r.owner else f"(released from {who}) {args.handoff}"
         it.add_entry("Handoff", note, r.owner)
-        it.drop("owner", "worktree", "claimed_at", "blocked")
+        gate = it.unblock()
+        it.drop("owner", "worktree", "claimed_at")
         it.set("updated_at", stamp())
         b.move(it, "In progress", "Todo", top=True)
-        return f"{it.id} back on top of Todo", {"id": it.id, "from": "In progress", "to": "Todo", "note": note}
+        return f"{it.id} back on top of Todo", {"id": it.id, "from": "In progress", "to": "Todo", "note": note, **gate}
     return r.mutate("release", fn)
 
 
@@ -556,11 +688,12 @@ def cmd_close(args, r: Repo) -> str:
             r.own(it, args.force)
         note = f"closed: {args.reason}"
         it.add_entry("Evidence", note, r.owner)
-        it.drop("owner", "worktree", "claimed_at", "blocked")
+        gate = it.unblock()
+        it.drop("owner", "worktree", "claimed_at")
         it.set("closed_at", stamp())
         it.set("updated_at", stamp())
         b.move(it, src, "Done")
-        return f"{it.id} closed", {"id": it.id, "from": src, "to": "Done", "note": note}
+        return f"{it.id} closed", {"id": it.id, "from": src, "to": "Done", "note": note, **gate}
     return r.mutate("close", fn)
 
 
@@ -591,6 +724,10 @@ def parser() -> argparse.ArgumentParser:
     s = cmd("list", cmd_list, "one line per plan and open task; done tasks only with --all")
     s.add_argument("--plan")
     s.add_argument("--all", action="store_true", help="include done and closed tasks")
+    s.add_argument("--check", action="store_true",
+                   help=f"print only problems (overdue, idle-ready plans, text naming merged PRs) and exit {EXIT_ATTENTION} if any")
+    s = cmd("gates", cmd_gates, "owner, reader and decision gates in 'after:' order with age and command; post it verbatim")
+    s.add_argument("--plan")
     s = cmd("show", cmd_show, "print one task or plan in full")
     s.add_argument("id")
     s = cmd("plan", cmd_plan, "create a plan, prints its id")
@@ -608,7 +745,8 @@ def parser() -> argparse.ArgumentParser:
     s = cmd("progress", cmd_progress, "record progress, a blocker (--blocked none clears it) or a handoff note")
     s.add_argument("id")
     s.add_argument("--note")
-    s.add_argument("--blocked")
+    s.add_argument("--blocked", help="'awaiting owner|reader|decision: ...' (a gate), 'awaiting ci|bot|review|pr:N|task:TB-x', "
+                   "'paused ...' or free text; then optional after: #N|TB-x, cmd: ..., due: YYYY-MM-DD lines")
     s.add_argument("--handoff")
     s.add_argument("--force", action="store_true", help="act on another owner's task (user-directed only)")
     s = cmd("complete", cmd_complete, "move a task to Done with evidence (commit, PR, path, checks run)")
@@ -636,9 +774,9 @@ def main(argv: list[str] | None = None) -> int:
         r.ensure_init()
         print(args.fn(args, r))
         return 0
-    except NothingEligible as e:
+    except Notice as e:
         print(e)
-        return EXIT_NOTHING
+        return e.code
     except Busy as e:
         print(f"taskboard: {e}", file=sys.stderr)
         return EXIT_BUSY

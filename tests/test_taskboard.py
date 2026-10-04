@@ -238,6 +238,125 @@ class TaskboardTest(unittest.TestCase):
         self.assertEqual(sum(1 for l in shown.splitlines() if l.startswith("- 20") and ("commit abc" in l or "tests ok" in l)), 2)
         self.assertLess(shown.index("commit abc"), shown.index("tests ok"))
 
+    def rewrite(self, old, new):
+        """Hand edit, as a user would between commands."""
+        text = self.board_text()
+        self.assertIn(old, text)
+        pathlib.Path(self.main, ".taskboard", "board.md").write_text(text.replace(old, new))
+
+    def set_field(self, key, value):
+        """Hand edit the first `- key:` line on the board."""
+        text = self.board_text()
+        line = next(l for l in text.splitlines() if l.startswith(f"- {key}:"))
+        self.rewrite(line, f"- {key}: {value}")
+
+    def rows(self, *argv):
+        return {l.split()[0]: l for l in self.ok(self.main, "list", *argv).splitlines()}
+
+    def last_log(self):
+        return tb.json.loads(pathlib.Path(self.main, ".taskboard", "log.jsonl").read_text().splitlines()[-1])
+
+    def test_typed_waits_show_blocked_only_for_owner_reader_and_decision(self):
+        plan, ids = self.seed(6)
+        texts = ["awaiting owner: merge #12", "awaiting reader: restore", "awaiting decision: keep orphans?",
+                 "awaiting ci", "paused for TB-0001", "awaiting pr:#12"]
+        for n, (tid, text) in enumerate(zip(ids, texts)):
+            self.ok(self.wts[n], "claim", tid)
+            self.ok(self.wts[n], "progress", tid, "--blocked", text)
+        rows = self.rows()
+        self.assertEqual([rows[t].split()[1] for t in ids], ["blocked"] * 3 + ["waiting"] * 3)
+        self.assertEqual(self.last_log()["waiting_on"], "pr:12")
+
+    def test_gates_follow_after_order_print_commands_and_log_latency(self):
+        plan, (a, b, c) = self.seed()
+        for n, tid in enumerate((a, b, c)):
+            self.ok(self.wts[n], "claim", tid)
+        self.ok(self.wts[0], "progress", a, "--blocked", "awaiting owner: merge #1677\nafter: #1678\ncmd: gh pr merge 1677")
+        self.ok(self.wts[1], "progress", b, "--blocked", "awaiting owner: merge #1678\ncmd: gh pr merge 1678")
+        self.ok(self.wts[2], "progress", c, "--blocked", "awaiting reader: restore THE-1\ndue: 2026-10-09")
+        out = self.ok(self.main, "gates")
+        self.assertLess(out.index("merge #1678"), out.index("merge #1677"))
+        self.assertIn("   after: #1678\n   cmd: gh pr merge 1677", out)
+        self.assertIn("[reader ", out)
+        self.assertIn("due 2026-10-09", out)
+        self.ok(self.wts[1], "progress", b, "--blocked", "none")
+        entry = self.last_log()
+        self.assertEqual((entry["blocked"], entry["waiting_on"]), ("none", "none"))
+        self.assertTrue(entry["gate_since"] <= entry["gate_cleared_at"])
+        self.assertNotIn("merge #1678", self.ok(self.main, "gates"))
+        self.ok(self.wts[0], "complete", a, "--evidence", "merged")
+        self.assertIn("gate_cleared_at", self.last_log())
+        self.assertNotIn("- cmd:", self.ok(self.main, "show", a))
+
+    def test_gates_with_none_open_and_bad_gate_lines(self):
+        plan, (a, *_) = self.seed()
+        self.assertEqual(self.ok(self.main, "gates"), "no open gates")
+        self.ok(self.wts[0], "claim", a)
+        code, out = self.tb(self.wts[0], "progress", a, "--blocked", "awaiting owner: x\nwhen: later")
+        self.assertEqual(code, 1)
+        self.assertIn("after:, cmd:, due:", out)
+        self.assertEqual(self.tb(self.wts[0], "progress", a, "--blocked", "awaiting owner: x\ndue: soon")[0], 1)
+
+    def test_log_keeps_blocked_note_and_handoff_apart(self):
+        plan, (a, *_) = self.seed()
+        self.ok(self.wts[0], "claim", a)
+        self.ok(self.wts[0], "progress", a, "--blocked", "awaiting ci", "--note", "pushed", "--handoff", "see PR")
+        entry = self.last_log()
+        self.assertEqual((entry["blocked"], entry["note"], entry["handoff"]), ("awaiting ci", "pushed", "see PR"))
+
+    def test_stale_counts_from_last_update_and_old_gates_are_flagged(self):
+        plan, (a, b, _) = self.seed()
+        self.ok(self.wts[0], "claim", a)
+        self.ok(self.wts[1], "claim", b)
+        self.ok(self.wts[1], "progress", b, "--blocked", "awaiting owner: upload")
+        self.set_field("claimed_at", "2000-01-01T00:00:00Z")  # old claim, fresh update
+        self.assertNotIn("!stale", self.ok(self.main, "list"))
+        self.set_field("updated_at", "2000-01-01T00:00:00Z")
+        self.set_field("gate_since", "2000-01-01T00:00:00Z")
+        rows = self.rows()
+        self.assertIn("!stale", rows[a])
+        self.assertIn("!gate", rows[b])
+
+    def test_idle_ready_flags_a_plan_with_ready_work_and_nobody_doing(self):
+        plan, (a, *_) = self.seed()
+        self.assertIn("!idle-ready", self.rows()[plan])
+        self.ok(self.wts[0], "claim", a)
+        self.assertNotIn("!idle-ready", self.rows()[plan])
+        self.ok(self.wts[0], "progress", a, "--blocked", "awaiting owner: merge")
+        self.assertIn("!idle-ready", self.rows()[plan])
+        proposals = self.ok(self.main, "plan", "Proposals")
+        self.ok(self.main, "add", "Idea", "--plan", proposals, "--outcome", "o", "--done-when", "x")
+        self.assertNotIn("!idle-ready", self.rows()[proposals])
+
+    def test_check_exits_4_on_overdue_gate_idle_plan_or_stale_pr_text_and_always_self_tests(self):
+        plan, (a, b, c) = self.seed()
+        code, out = self.tb(self.main, "list", "--check")
+        self.assertEqual(code, 4, out)
+        self.assertIn("!idle-ready", out)
+        self.assertIn("check: scanned 3 open tasks", out)
+        self.ok(self.wts[0], "claim", a)
+        self.assertIn("0 problems", self.ok(self.main, "list", "--check"))
+        self.ok(self.wts[1], "claim", b)
+        self.ok(self.wts[1], "progress", b, "--blocked", "awaiting reader: restore\ndue: 2000-01-01")
+        self.assertIn(f"{b} is past due 2000-01-01", self.tb(self.main, "list", "--check")[1])
+        self.ok(self.wts[1], "progress", b, "--blocked", "none")
+        self.rewrite("- due: 2000-01-01", "- due: 2999-01-01")
+        self.ok(self.main, "add", "Close out", "--plan", plan, "--outcome", "o", "--done-when", "PR 1642 re-approved")
+        self.ok(self.wts[0], "progress", a, "--note", "merged origin/main into PR 1642")
+        self.assertIn("0 problems", self.ok(self.main, "list", "--check"))
+        self.ok(self.wts[0], "complete", a, "--evidence", "PR #1642 merged as abc123")
+        code, out = self.tb(self.main, "list", "--check")
+        self.assertEqual(code, 4, out)
+        self.assertIn("TB-0004 names #1642", out)
+
+    def test_boards_written_before_typed_waits_still_read(self):
+        plan, (a, *_) = self.seed()
+        self.ok(self.wts[0], "claim", a)
+        self.ok(self.wts[0], "progress", a, "--blocked", "waiting")
+        self.rewrite("- blocked: waiting", "- blocked: awaiting coordinator: run DuckLake publish")
+        self.assertEqual(self.rows()[a].split()[1], "blocked")
+        self.assertIn("[owner ", self.ok(self.main, "gates"))
+
 
 if __name__ == "__main__":
     unittest.main()

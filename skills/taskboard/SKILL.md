@@ -17,26 +17,50 @@ Run it from inside your worktree. The first call connects the worktree, and ever
 
 | Command | Use |
 |---|---|
-| `list [--plan P-001] [--all]` | One line per plan and open task: `ready`, `waiting [needs ...]`, `doing [owner age]`, `blocked`. `age` is time since last activity; `!quiet` marks a doing task silent for over 30 minutes; `!stale 26h` shows the claim age. Done and closed tasks only with `--all` |
+| `list [--plan P-001] [--all]` | One line per plan and open task: `ready`, `waiting [needs ...]`, `doing [holder age]`, `waiting` (on CI, bot, review, a PR or task, or paused), `blocked` (on the owner, a reader, a decision, or untyped). `age` is time since the last update. Flags: `!quiet` (doing, silent 30 min), `!stale` (no update for 24 h), `!gate 6h` (a human gate open over 4 h), `!idle-ready` on a plan with ready tasks and nobody doing. Done and closed tasks only with `--all` |
+| `list --check` | Only problems: past `due:`, `!idle-ready` plans, open task text naming a PR marked merged or done. Exit 4 if any. The last line (`check: scanned ...`) always prints, so a watchdog can tell it read the board |
+| `gates [--plan P-001]` | The owner's queue: every owner, reader and decision gate, in `after:` order, oldest first, with age, `due` and `cmd:` |
 | `show ID` | One task or plan in full |
 | `plan "Title" --body "scope"` | Create a plan; prints `P-001` |
 | `add "Title" --plan P-001 --outcome "..." --done-when "..." [--done-when ...] [--depends-on TB-0001,TB-0002]` | Add a task at the end of Todo; prints `TB-0001` |
 | `claim [--plan P-001] [ID]` | Claim the first eligible task for your owner and print it |
-| `progress ID [--note "..."] [--blocked "reason" \| --blocked none] [--handoff "..."]` | Record progress, set or clear a blocker, leave handoff notes |
+| `progress ID [--note "..."] [--blocked "reason" \| --blocked none] [--handoff "..."]` | Record progress, set or clear a blocker (see Waits and gates), leave handoff notes |
 | `complete ID --evidence "..." [--evidence ...]` | Move to Done with evidence, one bullet per flag: commit SHA, PR link, file path, checks run |
 | `release ID --handoff "..."` | Put the task back on top of Todo for someone else |
 | `close ID --reason "..."` | Move a Todo or In progress task to Done as `closed` (not done), reason recorded as evidence. Dependents treat it like a done task |
 | `restore [BACKUP]` | List backups or restore one (user-directed) |
 
-Exit codes: `0` ok, `1` error (message says why, with `board.md:LINE` for a malformed board), `3` nothing eligible to claim (the output lists what remains and why), `75` board busy (wait a few seconds and retry).
+Exit codes: `0` ok, `1` error (message says why, with `board.md:LINE` for a malformed board), `3` nothing eligible to claim (the output lists what remains and why), `4` `list --check` found problems, `75` board busy (wait a few seconds and retry).
 
 ## Working through a plan
 
 1. If asked to prepare the work: `plan`, then `add` small tasks in the order they should be done. Each needs one outcome sentence and checkable `--done-when` criteria. Use `--depends-on` only for real prerequisites in the same plan.
 2. `claim --plan P-001`. The output is your task. Work it in your own worktree.
-3. Record `progress ID --note` at each milestone. Before stopping on any refusal or permission prompt you cannot resolve, run `progress ID --blocked "reason"`. For merge or deploy waits use `progress ID --blocked "awaiting ..."`. You may then claim another eligible task.
+3. Record `progress ID --note` at each milestone. Before stopping on anything you cannot resolve yourself, set a typed `--blocked` (next section). You may then claim another eligible task.
 4. When every done-when criterion holds, `complete ID --evidence "..."`. A dependent task's owner reads your evidence, so name the commit, branch, PR or file: repo-relative paths, commit SHAs, URLs, checks run, no absolute paths outside your worktree. If your sandbox refuses `complete`, record the evidence with `progress ID --note "done-when met; evidence: ..."` and report it; the orchestrator or user completes the task with `--force`. Do not work around the refusal.
 5. Claim again. Stop when `claim` exits 3. Report the remaining tasks and blockers it printed.
+
+## Waits and gates
+
+The first line of `--blocked` says what you wait on. The owner is the user who merges, uploads and decides; always call them `owner`, never coordinator or orchestrator.
+
+- Gates, which only a human clears and `gates` lists: `awaiting owner: merge #1677`, `awaiting reader: independent restore of THE-2348`, `awaiting decision: keep orphans?`.
+- Agent-side waits, shown as `waiting`: `awaiting ci`, `awaiting bot`, `awaiting review`, `awaiting pr:1677`, `awaiting task:TB-0012`, `paused ...`.
+- Optional lines under a gate: `after: #1678` or `after: TB-0012` (this gate comes after that one), `cmd: <exact command for the owner, with pins>`, `due: 2026-10-09`.
+
+```sh
+progress TB-0015 --blocked $'awaiting owner: merge #1677\nafter: #1678\ncmd: gh pr merge 1677 --squash'
+```
+
+`--blocked none` clears it. The log records when each gate opened and cleared.
+
+Orchestrators: the owner's queue is the output of `gates`, posted verbatim. Never hand-type a merge order or a list of owner asks; set `after:` on the gates and post the list again.
+
+Do not write a note when nothing changed. Waiting on an external gate with a date is `due:`, not a re-check note every few hours.
+
+## Batch pipelines
+
+Run a batch pipeline as one plan per batch with one task per step, so `list --plan` shows the step without reading notes. If any step needs a second identity or another external gate (an independent reader, a second human), make that the first task and have every task that needs it depend on it. Start it on day 0.
 
 ## Prompting a worker
 
@@ -49,5 +73,5 @@ One line is enough: `Use the taskboard skill with --owner worker-2 and claim TB-
 - Stay inside the assigned plan. Add subtasks the plan needs. Put broader discoveries in a plan titled `Proposals` (create it once) and do not claim them.
 - `close` only for a Proposals entry once the user has turned it into tickets, or a task the user says is superseded or dropped. Never to skip work.
 - `--force` (acting on another owner's task) and `restore` only when the user tells you to.
-- `!stale` in `list` means a claim is older than 24 hours. It is for the user to decide. Do not take the task over on your own.
+- `!stale` in `list` means a task had no update for 24 hours. It is for the user to decide. Do not take the task over on your own.
 - On a malformed-board error, tell the user the line. Do not repair the file by hand unless asked.
