@@ -83,14 +83,15 @@ class TaskboardTest(unittest.TestCase):
         self.assertEqual(status.stdout, "")
         self.assertTrue(os.path.exists(os.path.join(self.main, ".taskboard", "tb")))
 
-    def test_claim_follows_board_order_dependencies_and_one_task_per_worktree(self):
+    def test_claim_follows_board_order_dependencies_and_the_wip_limit(self):
         plan = self.ok(self.main, "plan", "P")
         a = self.ok(self.main, "add", "A", "--plan", plan, "--outcome", "a", "--done-when", "x")
         b = self.ok(self.main, "add", "B", "--plan", plan, "--outcome", "b", "--done-when", "x", "--depends-on", a)
         c = self.ok(self.main, "add", "C", "--plan", plan, "--outcome", "c", "--done-when", "x")
         self.assertIn(a, self.ok(self.wts[0], "claim", "--plan", plan).splitlines()[0])
-        code, out = self.tb(self.wts[0], "claim", "--plan", plan)
+        code, out = self.tb(self.wts[0], "claim", "--plan", plan, "--wip", "1")
         self.assertEqual(code, 1, out)
+        self.assertIn("WIP limit 1", out)
         self.assertIn(c, self.ok(self.wts[1], "claim", "--plan", plan).splitlines()[0])
         code, out = self.tb(self.wts[2], "claim", "--plan", plan)
         self.assertEqual(code, 3)
@@ -152,7 +153,7 @@ class TaskboardTest(unittest.TestCase):
     def test_two_owners_can_claim_in_one_worktree(self):
         plan, (a, b, _) = self.seed()
         self.ok(self.wts[0], "--owner", "x", "claim")
-        self.assertEqual(self.tb(self.wts[0], "--owner", "x", "claim")[0], 1)
+        self.assertEqual(self.tb(self.wts[0], "--owner", "x", "claim", "--wip", "1")[0], 1)
         self.assertIn(b, self.ok(self.wts[0], "--owner", "y", "claim"))
 
     def test_herdr_pane_is_the_default_owner(self):
@@ -164,7 +165,7 @@ class TaskboardTest(unittest.TestCase):
         plan, (a, *_) = self.seed()
         self.ok(self.wts[0], "claim")
         self.ok(self.wts[0], "progress", a, "--note", "line one\nline two", "--handoff", "see commit")
-        self.assertEqual(self.tb(self.wts[0], "progress", a, "--note", "ok\n## not a section")[0], 1)
+        self.ok(self.wts[0], "progress", a, "--note", "#1657 merged\n## not a section")
         text = self.board_text()
         self.assertEqual(tb.Board(text).render(), text)
         with open(os.path.join(self.main, ".taskboard", "board.md"), "a") as f:
@@ -175,7 +176,7 @@ class TaskboardTest(unittest.TestCase):
         with open(os.path.join(self.main, ".taskboard", "board.md"), "w") as f:
             f.write(text.replace(f"### {a} - Task 0\n- plan: {plan}", f"### {a} - Task 0\n- plan: {plan}\n- depends_on: {a}"))
         code, out = self.tb(self.main, "list")
-        self.assertIn("cycle", out)
+        self.assertIn(f"{a} cannot depend on itself", out)
 
     def test_every_change_is_backed_up_logged_and_restorable(self):
         self.seed(2)
@@ -356,6 +357,85 @@ class TaskboardTest(unittest.TestCase):
         self.rewrite("- blocked: waiting", "- blocked: awaiting coordinator: run DuckLake publish")
         self.assertEqual(self.rows()[a].split()[1], "blocked")
         self.assertIn("[owner ", self.ok(self.main, "gates"))
+
+
+    def test_hash_lines_are_kept_in_notes_and_escaped_in_raw_text(self):
+        plan = self.ok(self.main, "plan", "P", "--body", "#1 goal\n## not a section")
+        a = self.ok(self.main, "add", "#12 fix", "--plan", plan, "--outcome", "#1657 merged\n## x", "--done-when", "#1 ok")
+        self.ok(self.wts[0], "claim", a)
+        self.ok(self.wts[0], "progress", a, "--note", "#1657 merged\n## not a section")
+        shown = self.ok(self.main, "show", a)
+        for text in ("### TB-0001 - #12 fix", "\\#1657 merged\n\\## x", "- #1 ok", ": #1657 merged\n  ## not a section"):
+            self.assertIn(text, shown)
+        self.assertIn("\\#1 goal", self.ok(self.main, "show", plan))
+        self.assertEqual(tb.Board(self.board_text()).render(), self.board_text())
+
+    def test_note_appends_for_anyone_without_changing_state(self):
+        plan, (a, b, _) = self.seed()
+        self.ok(self.wts[0], "claim", a)
+        before = self.ok(self.main, "show", a)
+        self.ok(self.wts[1], "note", a, "#1642 merged 08:34Z; done-when 2 is moot")
+        after = self.ok(self.main, "show", a)
+        self.assertIn("claude@wt1: #1642 merged 08:34Z", after)
+        self.assertEqual([l for l in before.splitlines() if l.startswith("- ") and not l.startswith("- 20")],
+                         [l for l in after.splitlines() if l.startswith("- ") and not l.startswith("- 20")])
+        for target in (b, plan):
+            self.ok(self.wts[2], "note", target, "fact")
+        entry = self.last_log()
+        self.assertEqual((entry["cmd"], entry["id"], entry["note"]), ("note", plan, "fact"))
+
+    def test_edit_rewrites_task_text_with_old_and_new_in_the_log(self):
+        plan, (a, b, c) = self.seed()
+        self.ok(self.wts[1], "edit", a, "--title", "Renamed", "--outcome", "New outcome.", "--done-when", "y",
+                "--done-when", "z", "--depends-on", b, "--set", "due=2026-10-09", "--set", "prs=#1677 packet")
+        shown = self.ok(self.main, "show", a)
+        for text in ("### TB-0001 - Renamed", f"- depends_on: {b}", "- due: 2026-10-09", "- prs: #1677 packet",
+                     "#### Outcome\nNew outcome.\n\n#### Done when\n- y\n- z"):
+            self.assertIn(text, shown)
+        entry = self.last_log()
+        self.assertEqual((entry["old"]["title"], entry["new"]["title"]), ("Task 0", "Renamed"))
+        self.assertEqual((entry["old"]["done_when"], entry["new"]["done_when"]), (["checks pass"], ["y", "z"]))
+        self.assertNotIn("step", entry["new"])
+        self.assertEqual(tb.Board(self.board_text()).render(), self.board_text())
+        self.ok(self.wts[1], "edit", a, "--depends-on", "none", "--set", "due=none")
+        self.assertNotIn("- due:", self.ok(self.main, "show", a))
+        code, out = self.tb(self.wts[1], "edit", a, "--depends-on", a)
+        self.assertIn(f"{a} cannot depend on itself", out)
+        for bad in ("owner=me", "due=soon"):
+            self.assertEqual(self.tb(self.wts[1], "edit", a, "--set", bad)[0], 1, bad)
+        self.ok(self.wts[0], "claim", c)
+        self.assertEqual(self.tb(self.wts[1], "edit", c, "--title", "x")[0], 1)
+        self.ok(self.wts[1], "edit", c, "--title", "x", "--force")
+        self.ok(self.wts[0], "complete", c, "--evidence", "e")
+        self.assertIn("use note", self.tb(self.wts[0], "edit", c, "--title", "y")[1])
+        self.assertIn("- linear: THE-1", self.ok(self.main, "show", self.ok(
+            self.main, "add", "T", "--plan", plan, "--outcome", "o", "--done-when", "x", "--set", "linear=THE-1")))
+
+    def test_wip_counts_doing_and_waiting_but_not_gated_tasks(self):
+        plan, ids = self.seed(4)
+        self.ok(self.wts[0], "claim")
+        self.ok(self.wts[0], "claim")
+        self.assertEqual(self.tb(self.wts[0], "claim")[0], 1)
+        self.ok(self.wts[0], "progress", ids[0], "--blocked", "awaiting ci")
+        self.assertEqual(self.tb(self.wts[0], "claim")[0], 1)
+        self.ok(self.wts[0], "progress", ids[0], "--blocked", "awaiting owner: merge #1")
+        self.ok(self.wts[0], "claim")
+        self.ok(self.wts[0], "claim", "--wip", "3")
+
+    def test_complete_spawns_follow_ups_and_warns_when_one_is_mentioned_but_missing(self):
+        plan, (a, b, _) = self.seed()
+        self.ok(self.wts[0], "claim", a)
+        out = self.ok(self.wts[0], "complete", a, "--evidence", "PR #1 merged", "--spawn", "Fix the README",
+                      "--cleanup", "worktree removed")
+        self.assertIn("spawned TB-0004", out)
+        shown = self.ok(self.main, "show", a)
+        self.assertIn("- spawned: TB-0004", shown)
+        self.assertIn("- cleanup: worktree removed", shown)
+        spawned = self.ok(self.main, "show", "TB-0004")
+        self.assertIn("[Todo]", spawned)
+        self.assertIn(f"Follow-up of {a}", spawned)
+        self.ok(self.wts[0], "claim", b)
+        self.assertIn("warning:", self.ok(self.wts[0], "complete", b, "--evidence", "body lines left to their owners"))
 
 
 if __name__ == "__main__":
