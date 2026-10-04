@@ -68,6 +68,8 @@ python3 .taskboard/tb restore /path/to/board.md    # restore from any file, e.g.
 
 `python3 .taskboard/tb init` prints the board, log and backup paths.
 
+To start over in a clone, `python3 .taskboard/tb new` archives `board.md`, `log.jsonl`, any other file in the board dir, and the backups into `<git-common-dir>/backup-<utc>.tar.gz`. It checks that the archive lists every file, prints them, then writes an empty board and clears the log and backups. It refuses while a task is in progress unless given `--force`. To get the old board back: `tar -xzf .git/backup-<utc>.tar.gz taskboard/board.md`, then `restore` that file.
+
 ## Log
 
 Each change appends a line to `<git-common-dir>/taskboard/log.jsonl`:
