@@ -19,6 +19,7 @@ import pathlib
 import re
 import subprocess
 import sys
+import tarfile
 import time
 
 TEMPLATE = """# Taskboard
@@ -790,6 +791,33 @@ def cmd_restore(args, r: Repo) -> str:
     return f"restored {path} (previous board saved as a new backup)"
 
 
+def cmd_new(args, r: Repo) -> str:
+    """Archive the board dir and backups beside the board dir, check the archive lists every file, then reset."""
+    with r.locked():
+        if not args.force:
+            busy = [i.id for i in Board(r.read()).items["In progress"]]
+            if busy:
+                raise BoardError(f"{', '.join(busy)} still in progress; complete or release them first, "
+                                 "or rerun with --force (user-directed only)")
+        files = {f"taskboard/{n}": os.path.join(r.dir, n) for n in sorted(os.listdir(r.dir))
+                 if n != ".lock" and os.path.isfile(os.path.join(r.dir, n)) and not os.path.islink(os.path.join(r.dir, n))}
+        files.update({f"backups/{n}": os.path.join(r.backups, n) for n in r.list_backups()})
+        archive = os.path.join(os.path.dirname(r.dir), f"backup-{utcnow():%Y%m%dT%H%M%SZ}.tar.gz")
+        with tarfile.open(archive, "x:gz") as tar:
+            for name, path in files.items():
+                tar.add(path, arcname=name)
+        with tarfile.open(archive) as tar:
+            missing = sorted(set(files) - set(tar.getnames()))
+        if missing:
+            raise BoardError(f"{archive} lacks {', '.join(missing)}; nothing was reset")
+        write_atomic(r.board, TEMPLATE)
+        for name, path in files.items():
+            if name == "taskboard/log.jsonl" or name.startswith("backups/"):  # ponytail: other files stay, archived
+                os.remove(path)
+        r.append_log({"cmd": "new", "note": archive})
+    return f"archived {len(files)} files to {archive}:\n" + "\n".join(f"  {n}" for n in files) + f"\nfresh board at {r.board}"
+
+
 def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="taskboard", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -857,6 +885,9 @@ def parser() -> argparse.ArgumentParser:
     s.add_argument("id")
     s.add_argument("--reason", required=True)
     s.add_argument("--force", action="store_true", help="close another owner's task (user-directed only)")
+    s = cmd("new", cmd_new, "archive board, log and backups to backup-<utc>.tar.gz beside the board dir, then start "
+            "a fresh board (user-directed only)")
+    s.add_argument("--force", action="store_true", help="even with tasks in progress")
     s = cmd("restore", cmd_restore, "list backups, or restore one by name or path")
     s.add_argument("backup", nargs="?")
     return p

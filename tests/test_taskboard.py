@@ -437,6 +437,40 @@ class TaskboardTest(unittest.TestCase):
         self.ok(self.wts[0], "claim", b)
         self.assertIn("warning:", self.ok(self.wts[0], "complete", b, "--evidence", "body lines left to their owners"))
 
+    def test_new_archives_board_log_and_backups_beside_the_board_dir_then_resets(self):
+        plan, (a, *_) = self.seed()
+        self.ok(self.wts[0], "claim", a)
+        self.ok(self.wts[0], "complete", a, "--evidence", "e")
+        pathlib.Path(self.main, ".taskboard", "retro-x.md").write_text("report")
+        old_board, backups = self.board_text(), self.ok(self.main, "restore").splitlines()[1:]
+        out = self.ok(self.wts[1], "new")
+        archives = list(pathlib.Path(self.main, ".git").glob("backup-*Z.tar.gz"))
+        self.assertEqual(len(archives), 1, out)
+        self.assertIn(str(archives[0]), out)
+        with tb.tarfile.open(archives[0]) as tar:
+            names = set(tar.getnames())
+            self.assertEqual(tar.extractfile("taskboard/board.md").read().decode(), old_board)
+        expected = {"taskboard/board.md", "taskboard/log.jsonl", "taskboard/retro-x.md", *(f"backups/{n}" for n in backups)}
+        self.assertEqual(names, expected)
+        for name in expected:
+            self.assertIn(name, out)
+        self.assertEqual(self.board_text(), tb.TEMPLATE)
+        self.assertEqual([l["cmd"] for l in map(tb.json.loads, pathlib.Path(self.main, ".taskboard", "log.jsonl")
+                                                .read_text().splitlines())], ["new"])
+        self.assertIn("no backups", self.ok(self.main, "restore"))
+        self.assertTrue(pathlib.Path(self.main, ".taskboard", "retro-x.md").exists())
+
+    def test_new_refuses_while_tasks_are_in_progress_unless_forced(self):
+        plan, (a, *_) = self.seed()
+        self.ok(self.wts[0], "claim", a)
+        code, out = self.tb(self.main, "new")
+        self.assertEqual(code, 1)
+        self.assertIn(f"{a} still in progress", out)
+        self.assertEqual(list(pathlib.Path(self.main, ".git").glob("backup-*.tar.gz")), [])
+        self.assertIn(a, self.board_text())
+        self.ok(self.main, "new", "--force")
+        self.assertEqual(self.board_text(), tb.TEMPLATE)
+
 
 if __name__ == "__main__":
     unittest.main()

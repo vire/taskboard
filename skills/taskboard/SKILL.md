@@ -31,6 +31,7 @@ Run it from inside your worktree. The first call connects the worktree, and ever
 | `release ID --handoff "..."` | Put the task back on top of Todo for someone else |
 | `close ID --reason "..."` | Move a Todo or In progress task to Done as `closed` (not done), reason recorded as evidence. Dependents treat it like a done task |
 | `restore [BACKUP]` | List backups or restore one (user-directed) |
+| `new [--force]` | Archive board, log and backups into `backup-<utc>.tar.gz` beside the board dir, check the archive, start a fresh board. Refuses while tasks are in progress (user-directed) |
 
 Exit codes: `0` ok, `1` error (message says why, with `board.md:LINE` for a malformed board), `3` nothing eligible to claim (the output lists what remains and why), `4` `list --check` found problems, `75` board busy (wait a few seconds and retry).
 
@@ -78,6 +79,6 @@ One line is enough: `Use the taskboard skill with --owner worker-2 and claim TB-
 - If you claimed a task and then moved to another worktree (or your Herdr pane moved and got a new id), pass `--owner <owner shown on the task>` on every later command; the task then follows you. Never pass another agent's owner: that needs the user's go-ahead, like `--force`.
 - Stay inside the assigned plan. Add subtasks the plan needs. Put broader discoveries in a plan titled `Proposals` (create it once) and do not claim them.
 - `close` only for a Proposals entry once the user has turned it into tickets, or a task the user says is superseded or dropped. Never to skip work.
-- `--force` (acting on another owner's task) and `restore` only when the user tells you to.
+- `--force` (acting on another owner's task), `restore` and `new` only when the user tells you to.
 - `!stale` in `list` means a task had no update for 24 hours. It is for the user to decide. Do not take the task over on your own.
 - On a malformed-board error, tell the user the line. Do not repair the file by hand unless asked.
