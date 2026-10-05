@@ -607,7 +607,7 @@ AWAITING = re.compile(r"^awaiting\s+", re.I)
 
 
 def snip(text: str) -> str:
-    text = " ".join(str(text).strip().split("\n")[0].split())
+    text = " ".join(text.strip().split("\n")[0].split())
     return text if len(text) <= SNIP else text[:SNIP - 3] + "..."
 
 
@@ -615,7 +615,7 @@ def hm(ts: str) -> str:
     return ts[11:16] + "Z"
 
 
-def entries(it: Item, sub: str) -> list[tuple[str, str, str]]:
+def entries(it: Item, sub: str) -> list[list[str]]:
     """(ts, who, text) per bullet under `#### sub`; continuation lines stay as further lines of the text."""
     out: list[list[str]] = []
     for line in it.section(sub):
@@ -624,10 +624,10 @@ def entries(it: Item, sub: str) -> list[tuple[str, str, str]]:
             out.append(list(m.groups()))
         elif out and line.strip():
             out[-1][2] += "\n" + line.strip()
-    return [tuple(e) for e in out]
+    return out
 
 
-def last_note(it: Item) -> tuple[str, str, str] | None:
+def last_note(it: Item) -> list[str] | None:
     """The latest Progress entry that is not a blocked:/unblocked marker: what the task last said."""
     notes = [e for e in entries(it, "Progress") if not e[2].startswith(("blocked:", "unblocked"))]
     return notes[-1] if notes else None
@@ -741,20 +741,12 @@ def cmd_standup(args, r: Repo) -> str:
                   or any(e.get("id") and plan_of(e["id"]) == p.id for e in win))]
 
     # d. risks, as (task id, line) so --plan and --owner can filter them
-    risks = []
-    for it in b.items["In progress"]:
-        f, label = flag(it), age(it.get("updated_at") or it.get("claimed_at"))[0]
-        if f == "!stale":
-            risks.append((it.id, f"!stale {it.id} no update for {label} ({it.get('owner')})"))
-        elif f == "!quiet":
-            risks.append((it.id, f"!quiet {it.id} doing, silent {label} ({it.get('owner')})"))
+    why = {"!stale": "no update for", "!quiet": "doing, silent"}
+    risks = [(it.id, f"{f} {it.id} {why[f]} {age(it.get('updated_at') or it.get('claimed_at'))[0]} ({it.get('owner')})")
+             for it in b.items["In progress"] if (f := flag(it)) in why]
     risks += [(p.split()[1], p) for p in problems(b) if not p.startswith("!idle-ready")]  # problems() puts the id second
     for it in b.items["Done"]:
-        try:
-            fresh = since <= parse_ts(it.get("completed_at")) < until
-        except ValueError:  # a hand edit; no completion time, no follow-up check
-            fresh = False
-        if fresh and not it.get("spawned"):
+        if f"{since:{STAMP}}" <= it.get("completed_at") < f"{until:{STAMP}}" and not it.get("spawned"):  # stamps sort as text
             clauses = [c for _, _, text in entries(it, "Evidence") for c in re.split(r";\s+|\.\s+|\n", text)]
             hit = next((c for c in clauses if FOLLOW_UP.search(c)), None)
             risks += [(it.id, f'!follow-up {it.id} evidence says "{snip(hit)}", nothing spawned')] if hit else []
@@ -774,12 +766,9 @@ def cmd_standup(args, r: Repo) -> str:
     notes = by_cmd("note")
 
     def state(it: Item) -> str:
-        section = b.find(it.id)[0]
-        if section == "Done":
-            return "closed" if it.get("closed_at") else "done"
-        if section == "Todo":
-            return "waiting" if b.waiting(it) else "ready"
-        return "gated" if it.waiting_on in GATES else it.status
+        s = b.find(it.id)[0]
+        return (("closed" if it.get("closed_at") else "done") if s == "Done" else ("waiting" if b.waiting(it) else "ready")
+                if s == "Todo" else "gated" if it.waiting_on in GATES else it.status)
 
     last = events[-1]["ts"] if events else None
     tail = (f"last event {hm(last)}, {age(last)[0]} ago" if last else "log is empty") + note
@@ -878,9 +867,6 @@ def cmd_standup(args, r: Repo) -> str:
                     "text": WAIT.sub("", it.blocked), "since": it.get("gate_since") or it.get("updated_at"),
                     "due": it.get("due") or None, "after": it.get("after") or None, "cmd": it.get("cmd") or None}
 
-        def note_json(it: Item) -> dict | None:
-            note_ = last_note(it)
-            return dict(zip(("at", "by", "text"), note_)) if note_ else None
         ev = lambda e, **kw: {"id": e["id"], "by": e["owner"], "at": e["ts"], **kw}
         return {
             "operator": operator,
@@ -890,7 +876,7 @@ def cmd_standup(args, r: Repo) -> str:
             "needs_you": [gate_json(it) for it in gates],
             "owners": [{"owner": o, "done": [ev(e, how=e["cmd"], evidence=e.get("note", ""), spawned=e.get("spawned", []))
                                              for e in p["done"]],
-                        "doing": [{"id": i.id, "title": i.title, "updated_at": i.get("updated_at"), "last_note": note_json(i)}
+                        "doing": [{"id": i.id, "title": i.title, "updated_at": i.get("updated_at"), "last_note": dict(zip(("at", "by", "text"), n)) if (n := last_note(i)) else None}
                                   for i in p["held"] if i.status == "doing"],
                         "waiting": [{"id": i.id, "status": i.status, "kind": i.waiting_on, "text": i.blocked,
                                      "updated_at": i.get("updated_at"), "gate": number.get(i.id)}
@@ -906,14 +892,8 @@ def cmd_standup(args, r: Repo) -> str:
                         "gates_cleared": [{"id": e["id"], "since": e["gate_since"], "cleared": e["gate_cleared_at"]} for e in cleared],
                         "notes": [ev(e, text=e.get("note", "")) for e in notes]}}
 
-    if args.no_mark:
-        reason = "--no-mark"
-    elif args.since or args.plan or args.who is not None:
-        reason = "filtered"
-    elif agent_name() and not args.mark:
-        reason = "agent run; --mark to advance"
-    else:
-        reason = None
+    reason = ("--no-mark" if args.no_mark else "filtered" if args.since or args.plan or args.who is not None
+              else "agent run; --mark to advance" if agent_name() and not args.mark else None)
     out = render(reason)  # rendered before the marker moves, so a crash cannot lose the operator's window
     if reason is None:
         try:
