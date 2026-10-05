@@ -2,8 +2,10 @@
 import contextlib
 import importlib.util
 import io
+import json
 import os
 import pathlib
+import re
 import subprocess
 import sys
 import tempfile
@@ -17,15 +19,251 @@ tb = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(tb)
 
 
+# Fixture F from the standup spec: three owners, three plans (one Proposals), two gates (one past due), a quiet
+# doing task, a stale wait, a merged-PR note, an unspawned follow-up, a prose ask, a refusal, a close, a note.
+FX_BOARD = """# Taskboard
+
+## Plans
+
+### P-001 - Wave 2 payloads
+
+### P-002 - Docs
+
+### P-003 - Proposals
+
+## Todo
+
+### TB-0007 - Orphans packet
+- plan: P-001
+- depends_on: TB-0001
+
+#### Outcome
+Orphans packet merged.
+
+#### Done when
+- PR merged
+
+### TB-0008 - Runbook page
+- plan: P-002
+
+#### Outcome
+Runbook page published.
+
+#### Done when
+- page live
+
+### TB-0010 - Dispatcher idea
+- plan: P-003
+
+#### Outcome
+Proposal written.
+
+#### Done when
+- proposal noted
+
+## In progress
+
+### TB-0002 - Fibrosis receipt
+- plan: P-001
+- owner: w1
+- worktree: /wt/w1
+- claimed_at: 2026-10-05T08:00:00Z
+- updated_at: 2026-10-05T11:18:00Z
+- blocked: awaiting owner: merge #1751 (fibrosis receipt)
+- gate_since: 2026-10-05T11:18:00Z
+- cmd: gh pr merge 1751 --merge
+
+#### Outcome
+Receipt merged.
+
+#### Done when
+- receipt PR merged
+
+### TB-0003 - IPF restore
+- plan: P-001
+- owner: w2
+- worktree: /wt/w2
+- claimed_at: 2026-10-04T08:00:00Z
+- updated_at: 2026-10-05T12:00:00Z
+- blocked: awaiting reader: independent restore of THE-2348
+- gate_since: 2026-10-04T20:30:00Z
+- due: 2026-10-04
+
+#### Outcome
+Restore done by a second identity.
+
+#### Done when
+- restore evidence recorded
+
+### TB-0004 - Orphans-2 receipt
+- plan: P-001
+- owner: w2
+- worktree: /wt/w2
+- claimed_at: 2026-10-04T21:00:00Z
+- updated_at: 2026-10-05T11:24:00Z
+- blocked: awaiting ci: #1752
+
+#### Outcome
+Receipt merged.
+
+#### Done when
+- receipt PR merged
+
+#### Progress
+- 2026-10-05T11:24:00Z w2: DECISION NEEDED: convert or allowlist the 5 readers?
+
+### TB-0005 - Hair evidence merge
+- plan: P-001
+- owner: orch
+- worktree: /wt/orch
+- claimed_at: 2026-10-04T09:00:00Z
+- updated_at: 2026-10-04T10:00:00Z
+- blocked: awaiting pr:#1710 (rebase after #1706)
+
+#### Outcome
+Evidence PR merged.
+
+#### Done when
+- evidence PR merged
+
+#### Progress
+- 2026-10-05T09:32:00Z w2: #1710 merged as e0dd38c
+
+### TB-0006 - Viz cutover
+- plan: P-001
+- owner: w1
+- worktree: /wt/w1
+- claimed_at: 2026-10-05T09:10:00Z
+- updated_at: 2026-10-05T11:00:00Z
+
+#### Outcome
+Viz readers use the resolver.
+
+#### Done when
+- CI green
+
+#### Progress
+- 2026-10-05T11:00:00Z w1: rebased #1731 onto main, 140 tests pass
+
+## Done
+
+### TB-0001 - Shared resolver
+- plan: P-001
+- owner: w1
+- worktree: /wt/w1
+- claimed_at: 2026-10-05T06:00:00Z
+- updated_at: 2026-10-05T09:00:00Z
+- completed_at: 2026-10-05T09:00:00Z
+
+#### Outcome
+Resolver merged.
+
+#### Done when
+- resolver PR merged
+
+#### Evidence
+- 2026-10-05T09:00:00Z w1: #1744 merged as 2927583; docs follow-up: #1757
+
+### TB-0009 - Red main fix
+- plan: P-001
+- updated_at: 2026-10-05T08:00:00Z
+- closed_at: 2026-10-05T08:00:00Z
+
+#### Outcome
+Main green.
+
+#### Done when
+- main green
+
+#### Evidence
+- 2026-10-05T08:00:00Z orch: closed: superseded by #1739
+"""
+FX_LOG = """{"ts": "2026-10-04T08:00:00Z", "owner": "w2", "worktree": "/wt/w2", "cmd": "claim", "id": "TB-0003", "from": "Todo", "to": "In progress"}
+{"ts": "2026-10-04T09:00:00Z", "owner": "orch", "worktree": "/wt/orch", "cmd": "claim", "id": "TB-0005", "from": "Todo", "to": "In progress"}
+{"ts": "2026-10-04T10:00:00Z", "owner": "orch", "worktree": "/wt/orch", "cmd": "progress", "id": "TB-0005", "blocked": "awaiting pr:#1710 (rebase after #1706)", "waiting_on": "pr:1710"}
+{"ts": "2026-10-04T20:30:00Z", "owner": "w2", "worktree": "/wt/w2", "cmd": "progress", "id": "TB-0003", "gate_since": "2026-10-04T20:30:00Z", "blocked": "awaiting reader: independent restore of THE-2348", "waiting_on": "reader"}
+{"ts": "2026-10-04T21:00:00Z", "owner": "w2", "worktree": "/wt/w2", "cmd": "claim", "id": "TB-0004", "from": "Todo", "to": "In progress"}
+{"ts": "2026-10-05T04:54:00Z", "owner": "w2", "worktree": "/wt/w2", "cmd": "progress", "id": "TB-0004", "gate_since": "2026-10-05T04:54:00Z", "blocked": "awaiting owner: live upload", "waiting_on": "owner"}
+{"ts": "2026-10-05T06:00:00Z", "owner": "w1", "worktree": "/wt/w1", "cmd": "claim", "id": "TB-0001", "from": "Todo", "to": "In progress"}
+{"ts": "2026-10-05T08:00:00Z", "owner": "orch", "worktree": "/wt/orch", "cmd": "close", "id": "TB-0009", "from": "Todo", "to": "Done", "note": "closed: superseded by #1739"}
+{"ts": "2026-10-05T08:00:00Z", "owner": "w1", "worktree": "/wt/w1", "cmd": "claim", "id": "TB-0002", "from": "Todo", "to": "In progress"}
+{"ts": "2026-10-05T08:30:00Z", "owner": "orch", "worktree": "/wt/orch", "cmd": "add", "id": "TB-0008", "to": "Todo"}
+{"ts": "2026-10-05T09:00:00Z", "owner": "w1", "worktree": "/wt/w1", "cmd": "complete", "id": "TB-0001", "from": "In progress", "to": "Done", "note": "#1744 merged as 2927583; docs follow-up: #1757"}
+{"ts": "2026-10-05T09:10:00Z", "owner": "w1", "worktree": "/wt/w1", "cmd": "claim", "id": "TB-0006", "from": "Todo", "to": "In progress"}
+{"ts": "2026-10-05T09:25:00Z", "owner": "orch", "worktree": "/wt/orch", "cmd": "note", "id": "TB-0007", "note": "Decision: orphans go to data/_orphans/, owner agreed"}
+{"ts": "2026-10-05T09:30:00Z", "owner": "w1", "worktree": "/wt/w1", "cmd": "claim", "exit": 1, "reason": "w1 already works on TB-0006, TB-0002", "id": "TB-0007"}
+{"ts": "2026-10-05T09:32:00Z", "owner": "w2", "worktree": "/wt/w2", "cmd": "note", "id": "TB-0005", "note": "#1710 merged as e0dd38c"}
+{"ts": "2026-10-05T11:00:00Z", "owner": "w1", "worktree": "/wt/w1", "cmd": "progress", "id": "TB-0006", "note": "rebased #1731 onto main, 140 tests pass"}
+{"ts": "2026-10-05T11:14:00Z", "owner": "w2", "worktree": "/wt/w2", "cmd": "progress", "id": "TB-0004", "note": "Owner upload DONE", "gate_since": "2026-10-05T04:54:00Z", "gate_cleared_at": "2026-10-05T11:14:00Z", "blocked": "awaiting ci: #1752", "waiting_on": "ci"}
+{"ts": "2026-10-05T11:18:00Z", "owner": "w1", "worktree": "/wt/w1", "cmd": "progress", "id": "TB-0002", "gate_since": "2026-10-05T11:18:00Z", "blocked": "awaiting owner: merge #1751 (fibrosis receipt)", "waiting_on": "owner"}
+{"ts": "2026-10-05T11:24:00Z", "owner": "w2", "worktree": "/wt/w2", "cmd": "progress", "id": "TB-0004", "note": "DECISION NEEDED: convert or allowlist the 5 readers?"}
+{"ts": "2026-10-05T12:00:00Z", "owner": "w2", "worktree": "/wt/w2", "cmd": "progress", "id": "TB-0003", "note": "restore script rehearsed"}
+"""
+FX_HUMAN = """standup for vil, 2026-10-05T07:00:00Z to 2026-10-05T12:30:00Z (12 events; last event 12:00Z, 30m ago)
+
+NEEDS YOU (2)
+  1. [reader 16h, due 2026-10-04] independent restore of THE-2348 - TB-0003 P-001 w2
+  2. [owner 1h] merge #1751 (fibrosis receipt) - TB-0002 P-001 w1
+     cmd: gh pr merge 1751 --merge
+
+PEOPLE
+  orch
+    closed  TB-0009  superseded by #1739
+    waiting TB-0005  26h pr:#1710 (rebase after #1706)
+    next    TB-0007  Orphans packet
+  w1
+    done    TB-0001  #1744 merged as 2927583; docs follow-up: #1757
+    doing   TB-0006  2h Viz cutover
+                     last 11:00Z: rebased #1731 onto main, 140 tests pass
+    gated   TB-0002  (needs you 2)
+    next    TB-0007  Orphans packet
+  w2
+    waiting TB-0004  1h ci: #1752
+    gated   TB-0003  (needs you 1)
+    next    TB-0007  Orphans packet
+
+PLANS
+  P-001  Wave 2 payloads
+         todo 1 (1 ready) | in progress 5 (1 doing, 2 waiting, 2 gated) | done 2 (+2)
+  P-002  Docs
+         todo 1 (1 ready) | in progress 0 (0 doing, 0 waiting, 0 gated) | done 0 !idle-ready TB-0008
+  P-003  Proposals
+         todo 1 (1 ready) | in progress 0 (0 doing, 0 waiting, 0 gated) | done 0
+
+RISKS (6)
+  !stale TB-0005 no update for 26h (orch)
+  !quiet TB-0006 doing, silent 2h (w1)
+  !due TB-0003 is past due 2026-10-04 (awaiting reader: independent restore of THE-2348)
+  !stale-text TB-0005 names #1710, marked merged or done; update it with a note
+  !follow-up TB-0001 evidence says "docs follow-up: #1757", nothing spawned
+  !ask TB-0004 11:24Z w2: "DECISION NEEDED: convert or allowlist the 5 readers?" is not a gate
+
+CHANGES
+  new     TB-0008 P-002 Runbook page (orch, now ready)
+  closed  TB-0009 superseded by #1739
+  gates cleared (1): TB-0004 6.3h
+  note    TB-0007 09:25Z orch: Decision: orphans go to data/_orphans/, owner agreed
+  note    TB-0005 09:32Z w2: #1710 merged as e0dd38c
+
+marker: next standup for vil starts 2026-10-05T12:30:00Z
+"""
+NOW = "2026-10-05T12:30:00Z"
+
+
 def sh(cwd, *cmd):
     subprocess.run(cmd, cwd=cwd, check=True, capture_output=True)
 
 
-class TaskboardTest(unittest.TestCase):
+class BoardCase(unittest.TestCase):
+    """A throwaway repo with worktrees; helpers only, no tests."""
+    worktrees = 8
+    extra_env: dict = {}
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         root = os.path.realpath(self.tmp.name)
-        self.env = {"XDG_DATA_HOME": os.path.join(root, "xdg"), "TASKBOARD_OWNER": "", "HERDR_ENV": "", "HERDR_PANE_ID": ""}
+        self.env = {"XDG_DATA_HOME": os.path.join(root, "xdg"), "TASKBOARD_OWNER": "", "HERDR_ENV": "", "HERDR_PANE_ID": "",
+                    **self.extra_env}
         self._old_env = {k: os.environ.get(k) for k in self.env}
         os.environ.update(self.env)
         self.main = os.path.join(root, "repo")
@@ -33,7 +271,7 @@ class TaskboardTest(unittest.TestCase):
         sh(self.main, "git", "init", "-q")
         sh(self.main, "git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "x")
         self.wts = []
-        for n in range(8):
+        for n in range(self.worktrees):
             wt = os.path.join(root, f"wt{n}")
             sh(self.main, "git", "worktree", "add", "-q", "-b", f"b{n}", wt)
             self.wts.append(wt)
@@ -67,6 +305,8 @@ class TaskboardTest(unittest.TestCase):
                        "--done-when", "checks pass") for i in range(n)]
         return plan, ids
 
+
+class TaskboardTest(BoardCase):
     def test_any_run_links_every_existing_worktree(self):
         self.ok(self.main, "list")
         for wt in self.wts:
@@ -470,6 +710,290 @@ class TaskboardTest(unittest.TestCase):
         self.assertIn(a, self.board_text())
         self.ok(self.main, "new", "--force")
         self.assertEqual(self.board_text(), tb.TEMPLATE)
+
+
+class StandupTest(BoardCase):
+    worktrees = 0
+    extra_env = {"TASKBOARD_OPERATOR": "vil", "CLAUDECODE": ""}
+
+    def setUp(self):
+        super().setUp()
+        codex = {k: os.environ.pop(k) for k in list(os.environ) if k.startswith("CODEX")}
+        self.addCleanup(os.environ.update, codex)
+        self.now = NOW
+        patch = mock.patch.object(tb, "utcnow", lambda: tb.parse_ts(self.now))
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.ok(self.main, "init")
+        self.dir = pathlib.Path(self.main, ".git", "taskboard")
+        self.write(FX_BOARD, FX_LOG, "2026-10-05T07:00:00Z")
+
+    def write(self, board=None, log=None, marker=None):
+        for name, text in (("board.md", board), ("log.jsonl", log), ("standup-vil", marker)):
+            if text is not None:
+                (self.dir / name).write_text(text if name != "standup-vil" else text + "\n")
+
+    def append(self, line):
+        with open(self.dir / "log.jsonl", "a") as f:
+            f.write(line + "\n")
+
+    def marker(self, name="vil"):
+        path = self.dir / f"standup-{name}"
+        return path.read_text().strip() if path.is_file() else None
+
+    def standup(self, *argv):
+        return self.ok(self.main, "standup", *argv)
+
+    def section(self, out, head):
+        lines = out.splitlines()
+        start = next(n for n, line in enumerate(lines) if line.startswith(head)) + 1
+        end = next((n for n in range(start, len(lines)) if not lines[n].strip()), len(lines))
+        return lines[start:end]
+
+    def test_default_run_prints_the_round_gates_first(self):  # spec tests 1, 2, 3, 5, 6, 9, 31
+        out = self.standup()
+        self.assertEqual(out, FX_HUMAN.strip())
+        self.assertEqual(self.section(out, "NEEDS YOU"), ["  " + line for line in self.ok(self.main, "gates").splitlines()])
+
+    def test_next_is_the_claimable_task_or_why_not(self):  # 4
+        self.ok(self.main, "--owner", "w2", "claim", "TB-0007")
+        out = self.standup("--no-mark")
+        people = "\n".join(self.section(out, "PEOPLE"))
+        self.assertIn("  w2\n    waiting TB-0004  1h ci: #1752\n    doing   TB-0007  0m Orphans packet\n"
+                      "    gated   TB-0003  (needs you 1)\n    next    -        (WIP 2/2)", people)
+        self.assertEqual(people.count("    next    -        (nothing ready in P-001)"), 2)
+
+    def test_spawned_follow_up_and_gated_ask_are_not_risks(self):  # 7, 8
+        board = FX_BOARD.replace("- completed_at: 2026-10-05T09:00:00Z", "- completed_at: 2026-10-05T09:00:00Z\n- spawned: TB-0011")
+        board = board.replace("## In progress", "### TB-0011 - Docs line\n- plan: P-001\n\n#### Outcome\nx\n\n#### Done when\n- y\n\n"
+                              "## In progress")
+        board = board.replace("- blocked: awaiting ci: #1752", "- blocked: awaiting decision: convert or allowlist?\n"
+                              "- gate_since: 2026-10-05T11:24:00Z")
+        self.write(board, FX_LOG.replace('"note": "#1744 merged as 2927583; docs follow-up: #1757"',
+                                         '"note": "#1744 merged as 2927583; docs follow-up: #1757", "spawned": ["TB-0011"]'))
+        out = self.standup("--no-mark")
+        self.assertNotIn("!follow-up", out)
+        self.assertNotIn("!ask", out)
+        self.assertIn("NEEDS YOU (3)", out)
+        self.assertIn("  new     TB-0011 P-001 Docs line (w1, now ready)", out)
+
+    def test_marker_advances_once_and_the_window_is_half_open(self):  # 10, 11
+        self.append(json.dumps({"ts": "2026-10-05T12:29:59Z", "owner": "orch", "cmd": "note", "id": "TB-0007", "note": "early"}))
+        self.assertIn("orch: early", self.standup())
+        self.assertEqual(self.marker(), NOW)
+        self.append(json.dumps({"ts": NOW, "owner": "orch", "cmd": "note", "id": "TB-0007", "note": "late"}))
+        self.now = "2026-10-05T12:40:00Z"
+        out = self.standup()
+        self.assertIn("(1 events; last event 12:30Z, 10m ago)", out)
+        self.assertIn("orch: late", out)
+        self.assertNotIn("orch: early", out)
+        self.assertEqual([r.split()[:2] for r in self.section(out, "RISKS")],
+                         [["!stale", "TB-0005"], ["!quiet", "TB-0006"], ["!due", "TB-0003"], ["!stale-text", "TB-0005"],
+                          ["!ask", "TB-0004"]])
+        self.assertEqual(self.marker(), "2026-10-05T12:40:00Z")
+        self.now = "2026-10-05T12:50:00Z"
+        out = self.standup()
+        self.assertIn("(0 events;", out)
+        self.assertEqual(self.section(out, "CHANGES"), ["  none"])
+
+    def test_only_a_default_human_run_moves_the_marker(self):  # 12, 13
+        (self.dir / "standup-vil").unlink()
+        for argv, why in ((["--no-mark"], "--no-mark"), (["--since", "2h"], "filtered"), (["--plan", "P-001"], "filtered"),
+                          (["--owner", "w1"], "filtered")):
+            self.assertTrue(self.standup(*argv).endswith(f"marker: unchanged ({why})"), argv)
+            self.assertIsNone(self.marker(), argv)
+        for key in ("CLAUDECODE", "CODEX_THREAD_ID"):
+            os.environ[key] = "1"
+            self.addCleanup(os.environ.pop, key, None) if key != "CLAUDECODE" else None
+            self.assertTrue(self.standup().endswith("marker: unchanged (agent run; --mark to advance)"), key)
+            self.assertIsNone(self.marker())
+            self.standup("--mark")
+            self.assertEqual(self.marker(), NOW)
+            (self.dir / "standup-vil").unlink()
+            os.environ.pop(key) if key != "CLAUDECODE" else os.environ.__setitem__(key, "")
+
+    def test_missing_future_or_unreadable_marker_means_the_last_24h(self):  # 14, 17, 32
+        (self.dir / "standup-vil").unlink()
+        out = self.standup()
+        self.assertIn("2026-10-04T12:30:00Z to 2026-10-05T12:30:00Z (16 events;", out)
+        self.assertIn("no previous standup for vil, last 24h", out)
+        self.assertEqual(self.marker(), NOW)
+        self.write(marker="2026-10-06T00:00:00Z")
+        self.assertIn("marker 2026-10-06T00:00:00Z is in the future, last 24h", self.standup())
+        self.assertEqual(self.marker(), NOW)
+        (self.dir / "standup-vil").unlink()
+        (self.dir / "standup-vil").mkdir()
+        code, out = self.tb(self.main, "standup")
+        self.assertEqual(code, 0, out)
+        self.assertIn("no previous standup for vil", out)
+        self.assertIn("taskboard: marker not saved:", out)
+        self.assertIn("\nCHANGES\n", out)
+        self.assertIn("\nmarker: unchanged (write failed)\ntaskboard: marker not saved:", out)
+        self.assertEqual([p.name for p in self.dir.glob("standup-vil.tmp*")], [])
+        data = json.loads(self.tb(self.main, "standup", "--json")[1].split("taskboard: marker not saved")[0])
+        self.assertEqual((data["marked"], data["marker_reason"]), (False, "write failed"))
+
+    def test_since_forms_and_errors(self):  # 15
+        for arg, start in (("90m", "2026-10-05T11:00:00Z"), ("2d", "2026-10-03T12:30:00Z"), ("2026-10-05", "2026-10-05T00:00:00Z"),
+                           ("2026-10-05T07:00Z", "2026-10-05T07:00:00Z"), ("2026-10-05T07:00:00Z", "2026-10-05T07:00:00Z")):
+            self.assertTrue(self.standup("--since", arg).startswith(f"standup for vil, {start} to {NOW}"), arg)
+        self.assertTrue(self.standup("--since", "2026-10-05T09:00+02:00").startswith("standup for vil, 2026-10-05T07:00:00Z to"))
+        for arg in ("yesterday", "2026-10-06", "9999999d"):
+            code, out = self.tb(self.main, "standup", "--since", arg)
+            self.assertEqual(code, 1, out)
+            self.assertIn("--since", out)
+
+    def test_operators_keep_separate_markers(self):  # 16
+        os.environ["TASKBOARD_OPERATOR"] = "hynek"
+        self.standup()
+        self.assertEqual(self.marker("hynek"), NOW)
+        self.assertEqual(self.marker(), "2026-10-05T07:00:00Z")
+        os.environ["TASKBOARD_OPERATOR"] = "a/b c"
+        self.standup()
+        self.assertEqual(self.marker("a_b_c"), NOW)
+
+    def test_malformed_board_fails_and_bad_log_lines_are_skipped(self):  # 18, 19, 29
+        log = (self.dir / "log.jsonl").read_bytes()
+        self.write(FX_BOARD.replace("\n## Done\n", "\n## Finished\n"))
+        code, out = self.tb(self.main, "standup")
+        self.assertEqual(code, 1)
+        self.assertRegex(out, r"board\.md:\d+: unknown section")
+        self.assertEqual((self.dir / "log.jsonl").read_bytes(), log)
+        self.assertEqual(self.marker(), "2026-10-05T07:00:00Z")
+        self.write(FX_BOARD)
+        self.append(json.dumps({"ts": "2026-10-05T12:05:00Z", "owner": "orch", "cmd": "note", "id": "TB-0099", "note": "gone"}))
+        self.append('{"cmd": "note"}')
+        self.append('{"ts": "2026-10-05T12:10:00Z", "own')
+        out = self.standup()
+        self.assertIn("(12 events; last event 12:05Z, 25m ago; skipped 2 unreadable log lines)", out)
+        self.assertNotIn("TB-0099", out)
+
+    def test_long_note_lists_are_capped_in_text_but_not_in_json(self):  # 21
+        for n in range(12):
+            self.append(json.dumps({"ts": f"2026-10-05T10:{n:02d}:00Z", "owner": "orch", "cmd": "note", "id": "TB-0007",
+                                    "note": f"note {n}"}))
+        out = self.standup("--no-mark")
+        self.assertEqual(sum(1 for line in out.splitlines() if line.startswith("  note ")), 8)
+        self.assertIn("  ... +6 more: TB-0007\n", out)
+        notes = json.loads(self.standup("--json", "--no-mark"))["changes"]["notes"]
+        self.assertEqual(len(notes), 14)
+        gated = "".join(f"### TB-{n:04d} - Gate {n}\n- plan: P-001\n- owner: w3\n- worktree: /wt/w3\n- claimed_at: {NOW}\n"
+                        f"- updated_at: {NOW}\n- blocked: awaiting owner: merge #{n}\n- gate_since: {NOW}\n\n"
+                        for n in range(20, 30))
+        self.write(FX_BOARD.replace("\n## Done\n", "\n" + gated + "## Done\n"))
+        needs = self.section(self.standup("--no-mark"), "NEEDS YOU (12)")
+        self.assertEqual([line.split(".")[0].strip() for line in needs if not line.startswith("     ")],
+                         [str(n) for n in range(1, 13)])
+
+    def test_markdown_json_and_brief(self):  # 22, 23, 24
+        md = self.standup("--markdown")
+        self.assertFalse([line for line in md.splitlines() if line.startswith(("#", "|"))])
+        for head in ("*Needs you (2)*", "*People*", "*Plans*", "*Risks (6)*", "*Changes*"):
+            self.assertIn("\n" + head + "\n", md)
+        self.assertIn("\n   cmd: `gh pr merge 1751 --merge`\n", md)
+        self.assertIn("- gated `TB-0002` (needs you 2)", md)
+        for line in md.splitlines():  # the id columns: gate lines, owner rows, plans, risks, changes
+            head = re.match(r"(\d+\. \[.*?\] .* - .*|- \w[\w-]* [^ ]+|- !\S+ \S+|- `P-\d+`)", line)
+            if head and not line.startswith("- next -"):
+                self.assertNotRegex(re.sub(r"`[^`]*`", "", head.group(0)).split("] ")[-1].split(" - ")[-1],
+                                    r"\b(TB|P)-\d+\b", line)
+        self.assertNotIn("marker:", md)
+        self.write(marker="2026-10-05T07:00:00Z")
+        data = json.loads(self.standup("--json"))
+        self.assertEqual(list(data), ["operator", "window", "filters", "marked", "marker_reason", "needs_you", "owners",
+                                      "plans", "risks", "changes"])
+        self.assertEqual((data["window"]["source"], data["marked"]), ("marker", True))
+        w1 = next(o for o in data["owners"] if o["owner"] == "w1")
+        self.assertEqual(w1["done"][0]["evidence"], "#1744 merged as 2927583; docs follow-up: #1757")
+        self.assertEqual(["  " + r for r in data["risks"]], self.section(FX_HUMAN, "RISKS"))
+        self.write(marker="2026-10-05T07:00:00Z")
+        brief = self.standup("--brief").splitlines()
+        self.assertEqual([line.split()[0] for line in brief[-5:]], ["PEOPLE", "PLANS", "RISKS", "CHANGES", "marker:"])
+        self.assertEqual(brief[1:5], ["NEEDS YOU (2)", *self.section(FX_HUMAN, "NEEDS YOU")])
+
+    def test_owner_and_plan_filters(self):  # 25, 26, 30
+        out = self.ok(self.main, "--owner", "orch", "standup", "--owner", "w1")
+        self.assertEqual(self.section(out, "NEEDS YOU (1)"), ["  2. [owner 1h] merge #1751 (fibrosis receipt) - TB-0002 P-001 w1",
+                                                              "     cmd: gh pr merge 1751 --merge"])
+        self.assertEqual(self.section(out, "PEOPLE"), self.section(FX_HUMAN, "PEOPLE")[4:10])
+        self.assertEqual([line for line in self.section(out, "PLANS") if line.startswith("  P-")], ["  P-001  Wave 2 payloads"])
+        self.assertEqual([r.split()[:2] for r in self.section(out, "RISKS")], [["!quiet", "TB-0006"], ["!follow-up", "TB-0001"]])
+        self.assertEqual(self.section(out, "CHANGES"), ["  none"])
+        self.assertEqual(tb.parser().parse_args(["--owner", "orch", "standup", "--owner", "w1"]).owner, "orch")
+        out = self.standup("--plan", "P-002")
+        self.assertEqual(self.section(out, "NEEDS YOU (0)"), ["  no open gates"])
+        self.assertEqual(self.section(out, "PEOPLE"), ["  none"])
+        self.assertEqual([line for line in self.section(out, "PLANS") if line.startswith("  P-")], ["  P-002  Docs"])
+        self.assertEqual(self.section(out, "CHANGES"), ["  new     TB-0008 P-002 Runbook page (orch, now ready)"])
+        code, out = self.tb(self.main, "standup", "--owner", "")
+        self.assertEqual((code, self.marker()), (1, "2026-10-05T07:00:00Z"), out)
+        code, out = self.tb(self.main, "standup", "--owner", "nobody")
+        self.assertEqual(code, 1)
+        self.assertIn("no such owner nobody", out)
+        code, out = self.tb(self.main, "standup", "--plan", "P-009")
+        self.assertEqual(code, 1)
+        self.assertIn("no such plan P-009", out)
+
+    def test_reads_only_on_every_kind_of_run(self):  # 20
+        before = [(self.dir / n).read_bytes() for n in ("board.md", "log.jsonl")]
+        for argv in ([], ["--no-mark"], ["--since", "2h"], ["--plan", "P-001"], ["--owner", "w1"], ["--brief"], ["--markdown"],
+                     ["--json"], ["--mark"], ["--since", "nope"], ["--plan", "P-009"]):
+            self.tb(self.main, "standup", *argv)
+            self.assertEqual([(self.dir / n).read_bytes() for n in ("board.md", "log.jsonl")], before, argv)
+        self.assertFalse(os.path.exists(tb.Repo().backups))
+
+    def test_ask_is_answered_by_a_later_gate_or_unblock_and_reads_any_owner_label(self):
+        progress = ("- 2026-10-05T11:24:00Z w2: DECISION NEEDED: convert or allowlist the 5 readers?\n"
+                    "- 2026-10-05T11:30:00Z w2: blocked: awaiting decision: convert or allowlist?\n"
+                    "- 2026-10-05T12:00:00Z w2: blocked: awaiting ci: #1752")
+        self.write(FX_BOARD.replace("- 2026-10-05T11:24:00Z w2: DECISION NEEDED: convert or allowlist the 5 readers?", progress))
+        self.assertNotIn("!ask", self.standup("--no-mark"))
+        board = FX_BOARD.replace("- 2026-10-05T11:00:00Z w1: rebased #1731 onto main, 140 tests pass",
+                                 "- 2026-10-05T11:00:00Z claude@my repo: rebased #1731 onto main\n  second line\n"
+                                 "- 2026-10-05T11:05:00Z claude@my repo: first line\n  decision needed: keep both readers?")
+        self.write(board.replace("- blocked: awaiting pr:#1710 (rebase after #1706)", "- blocked: awaiting legal sign-off"))
+        out = self.standup("--no-mark")
+        self.assertIn("                     last 11:05Z: first line", out)
+        self.assertIn('!ask TB-0006 11:05Z claude@my repo: "decision needed: keep both readers?" is not a gate', out)
+        self.assertIn("    blocked TB-0005  26h awaiting legal sign-off", out)
+        self.write(FX_BOARD.replace("- 2026-10-05T11:00:00Z w1: rebased #1731 onto main, 140 tests pass",
+                                    "- 2026-10-05T11:00:00Z w1: rebased\n- see the PR thread for details: decision needed"))
+        out = self.standup("--no-mark")
+        self.assertIn('!ask TB-0006 11:00Z w1: "- see the PR thread for details: decision needed"', out)  # a continuation line
+        self.assertIn("last 11:00Z: rebased", out)
+
+    def test_a_render_crash_leaves_the_marker(self):
+        with mock.patch.object(tb, "gate_block", side_effect=RuntimeError("boom")), self.assertRaises(RuntimeError):
+            self.tb(self.main, "standup")
+        self.assertEqual(self.marker(), "2026-10-05T07:00:00Z")
+
+    def test_odd_log_events_and_hand_edited_times_are_skipped_not_fatal(self):
+        base = {"ts": "2026-10-05T12:05:00Z", "owner": "orch", "cmd": "note", "id": "TB-0007", "note": "x"}
+        for odd in ({"owner": None}, {"cmd": None}, {"id": ["TB-0007"]}, {"cmd": "complete", "spawned": None},
+                    {"cmd": "edit", "new": None}, {"cmd": "close", "note": None}, {"cmd": "progress", "gate_since": "2026-10-05", "gate_cleared_at": NOW}):
+            self.append(json.dumps({k: v for k, v in {**base, **odd}.items() if v is not None or k in ("spawned", "new", "note")}))
+        self.append("[1, 2]")
+        self.write(FX_BOARD.replace("- completed_at: 2026-10-05T09:00:00Z", "- completed_at: 2026-10-05 09:00"))
+        out = self.standup("--no-mark")
+        self.assertIn("; skipped 8 unreadable log lines)", out)
+        self.assertNotIn("!follow-up", out)
+
+    def test_old_logs_and_a_fresh_board(self):  # 27, 28
+        old = [json.loads(line) for line in FX_LOG.splitlines()]
+        for e in old:
+            if "blocked" in e:
+                e["note"] = e.pop("blocked")
+                e.pop("waiting_on", None), e.pop("gate_since", None), e.pop("gate_cleared_at", None)
+        self.write(log="".join(json.dumps(e) + "\n" for e in old))
+        out = self.standup("--no-mark")
+        self.assertNotIn("gates cleared", out)
+        self.ok(self.main, "--owner", "orch", "new", "--force")
+        self.now = "2026-10-05T12:31:00Z"
+        out = self.standup()
+        self.assertIn("  board   new by orch at 12:30Z", out)
+        self.assertIn("  no open gates", out)
+        for head in ("PEOPLE", "PLANS", "RISKS"):
+            self.assertEqual(self.section(out, head), ["  none"], head)
 
 
 if __name__ == "__main__":
