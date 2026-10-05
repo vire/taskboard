@@ -69,14 +69,14 @@ tab ACME-130  orchestrator  P-004  billing split: 2 workers, reviewer
 
 ## 3. Roles
 
-| Role | Model, effort | Started by | Does | Never |
-|---|---|---|---|---|
-| Operator | human | - | Merges, runs prod and live commands, decides. Clears gates in `tb gates` order | - |
-| Coordinator | the operator's own session | operator | Creates one Herdr tab per track, starts the orchestrator, relays approvals and decisions, runs the watchdog, posts updates to `<OPERATOR_CHANNEL>` | Runs gated commands for the operator |
-| Orchestrator | Opus, medium | coordinator | Owns the plan and the gate list, starts workers, the reviewer and the consultant, records decisions on the board | Writes the diff, merges, closes panes it did not start |
-| Worker | Sonnet, high | orchestrator | One claimed task, in its own worktree, with its own `--owner`. Runs spec, failing test, implementation, PR. At most 2-3 at a time | Shares a worktree, runs anything gated |
-| Reviewer | Opus, high | orchestrator | Reads the full diff at the exact head against the task and the checklist, then posts findings on the PR | Reviews a diff it wrote |
-| Consultant | Fable | orchestrator | Answers one real dilemma (design fork, unclear evidence, conflicting rules). Closed after the one question | Stays open, writes code |
+| Role | Model, effort | Started by | Does |
+|---|---|---|---|
+| Operator | human | - | Merges, runs prod and live commands, decides. Clears gates in `tb gates` order |
+| Coordinator | the operator's own session | operator | Creates one Herdr tab per track, starts the orchestrator, relays approvals and decisions, runs the watchdog, posts updates to `<OPERATOR_CHANNEL>` |
+| Orchestrator | Opus, medium | coordinator | Owns the plan and the gate list, starts workers, the reviewer and the consultant, records decisions on the board |
+| Worker | Sonnet, high | orchestrator | One claimed task, in its own worktree, with its own `--owner`. Runs spec, failing test, implementation, PR. At most 2-3 at a time |
+| Reviewer | Opus, high | orchestrator | Never the diff author. Reads the full diff at the exact head against the task and the checklist, then posts findings on the PR |
+| Consultant | Fable | orchestrator | Answers one real dilemma (design fork, unclear evidence, conflicting rules). Closed after the one question |
 
 ## 4. Launch
 
@@ -220,9 +220,18 @@ Batch review fixes into one push. Every new head resets the bot, CI and the revi
 
 ## Lessons learned (append as you go)
 
-- Green alone, red together: two PRs passed CI separately and broke main merged back to back. Rebase and re-run after each merge.
-- A typed-out merge order in chat was replaced by a later message without it. Only `tb gates` carries order.
-- Watchdogs print a self-test line every run. A silent watchdog is a broken one.
+- **Ticket IDs in branch names auto-close tickets.** A ticket showed Done while the work was half merged. Keep IDs in the PR body only.
+- **State the merge order** in every PR body and as `after:` on the gates. Post `tb gates` verbatim; a hand-typed list goes stale.
+- **PRs that are green alone can go red together.** Rebase on main and re-run CI after every merge, before calling the next PR ready.
+- **Stale bot approvals do not count.** The verdict must be for the current head SHA. A label left over from an earlier head is not a review.
+- **No merges without approval**, whatever the checklist says. Agents prepare; the owner merges and runs prod.
+- **Poll GitHub gently.** Once every 5 minutes per PR at most. For a gate with a date, use `due:` instead of re-check notes.
+- **One worktree per worker, deleted after merge.** Shared worktrees mix diffs. Kept worktrees fill the disk.
+- **Watchdog self-test lines.** A monitor with a bug can check nothing for hours. Print a line every run, and read it.
+- **Batch operator pings and post `tb gates` verbatim.** One message per window, with every gate ready and its command. Clearing five gates in one sitting beats five pings.
+- **Idle with ready work.** `!idle-ready` on a plan means nobody is claiming. Waiting on a gate is a reason to claim the next task, not to stop.
+- **Needs from a second person go first.** If a gate needs someone besides the operator (a DBA sign-off, a second reviewer), make it the first task, on day 0.
+- **One name for the human.** Gate text says `owner`, never coordinator or orchestrator, so `tb gates` finds every ask.
 ````
 
 ## 7. Worker and reviewer prompts
@@ -251,9 +260,7 @@ Post one review on the PR: blocking and non-blocking findings, each with file:li
 Consultant (one question, then close the pane):
 
 ```text
-One decision for ACME-123, no code. <Dilemma, e.g. backfill in one long job or per-tenant batches?>
-Facts: <numbers, constraints, links>. Options: A <...>, B <...>.
-Answer with: the choice, why, and what fact would flip it.
+One question, no code: <dilemma>. Facts: <numbers, links>. Answer with the choice, why, and what would flip it.
 ```
 
 The orchestrator records the answer with `tb note TB-x "consultant: chose B because ...; would flip if ..."`.
@@ -281,15 +288,4 @@ The orchestrator records the answer with `tb note TB-x "consultant: chose B beca
 
 ## 9. Pitfalls
 
-- **Ticket IDs in branch names auto-close tickets.** A ticket showed Done while the work was half merged. Keep IDs in the PR body only.
-- **State the merge order** in every PR body and as `after:` on the gates. Post `tb gates` verbatim; a hand-typed list goes stale.
-- **PRs that are green alone can go red together.** Rebase on main and re-run CI after every merge, before calling the next PR ready.
-- **Stale bot approvals do not count.** The verdict must be for the current head SHA. A label left over from an earlier head is not a review.
-- **No merges without approval**, whatever the checklist says. Agents prepare; the owner merges and runs prod.
-- **Poll GitHub gently.** Once every 5 minutes per PR at most. For a gate with a date, use `due:` instead of re-check notes.
-- **One worktree per worker, deleted after merge.** Shared worktrees mix diffs. Kept worktrees fill the disk.
-- **Watchdog self-test lines.** A monitor with a bug can check nothing for hours. Print a line every run, and read it.
-- **Batch operator pings and post `tb gates` verbatim.** One message per window, with every gate ready and its command. Clearing five gates in one sitting beats five pings.
-- **Idle with ready work.** `!idle-ready` on a plan means nobody is claiming. Waiting on a gate is a reason to claim the next task, not to stop.
-- **Needs from a second person go first.** If a gate needs someone besides the operator (a DBA sign-off, a second reviewer), make it the first task, on day 0.
-- **One name for the human.** Gate text says `owner`, never coordinator or orchestrator, so `tb gates` finds every ask.
+They are the "Lessons learned" in the BRIEF.md template (section 6). Append new ones there after each retro.
