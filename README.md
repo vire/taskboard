@@ -39,6 +39,7 @@ python3 .taskboard/tb list            # plans and open tasks, one line each
 python3 .taskboard/tb list --all      # including done
 python3 .taskboard/tb show TB-0003    # one task in full
 python3 .taskboard/tb gates           # the owner's queue in merge order, with commands
+python3 .taskboard/tb standup         # what happened since your last standup: gates, people, plans, risks, changes
 python3 .taskboard/tb list --check    # problems only, exit 4 if any (for a cron watchdog)
 python3 .taskboard/tb --help
 ```

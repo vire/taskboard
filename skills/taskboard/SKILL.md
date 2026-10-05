@@ -20,6 +20,7 @@ Run it from inside your worktree. The first call connects the worktree, and ever
 | `list [--plan P-001] [--all]` | One line per plan and open task: `ready`, `waiting [needs ...]`, `doing [holder age]`, `waiting` (on CI, bot, review, a PR or task, or paused), `blocked` (on the owner, a reader, a decision, or untyped). `age` is time since the last update. Flags: `!quiet` (doing, silent 30 min), `!stale` (no update for 24 h), `!gate 6h` (a human gate open over 4 h), `!idle-ready` on a plan with ready tasks and nobody doing. Done and closed tasks only with `--all` |
 | `list --check` | Only problems: past `due:`, `!idle-ready` plans, open task text naming a PR marked merged or done. Exit 4 if any. The last line (`check: scanned ...`) always prints, so a watchdog can tell it read the board |
 | `gates [--plan P-001]` | The owner's queue: every owner, reader and decision gate, in `after:` order, oldest first, with age, `due` and `cmd:` |
+| `standup [--since 2h] [--plan P-001] [--owner L] [--brief\|--markdown\|--json]` | The operator's standup round since their last one: gates first, then each owner's done, doing, waiting and next, plan progress, risks and changes. Reads only; a default run by the operator advances their "last standup" marker, an agent run does not unless given `--mark` |
 | `show ID` | One task or plan in full |
 | `plan "Title" --body "scope"` | Create a plan; prints `P-001` |
 | `add "Title" --plan P-001 --outcome "..." --done-when "..." [--done-when ...] [--depends-on TB-0001,TB-0002] [--set due=2026-10-09]` | Add a task at the end of Todo; prints `TB-0001`. Optional fields with `--set`: `due`, `linear` (ticket id), `prs` (`#1677 packet, #1678 receipt`), `step` |
@@ -57,7 +58,7 @@ progress TB-0015 --blocked $'awaiting owner: merge #1677\nafter: #1678\ncmd: gh 
 
 `--blocked none` clears it. The log records when each gate opened and cleared.
 
-Orchestrators: the owner's queue is the output of `gates`, posted verbatim. Never hand-type a merge order or a list of owner asks; set `after:` on the gates and post the list again.
+Orchestrators: the owner's queue is the output of `gates`, posted verbatim. Never hand-type a merge order or a list of owner asks; set `after:` on the gates and post the list again. A full round-up is `standup --markdown`, posted verbatim. Before posting it, turn each `!ask` into a typed gate (that clears it) and add each `!follow-up` as a task once (the line stays until the completion leaves the operator's window). When the user asks for a standup, run `standup` and show its output unchanged; do not summarize it.
 
 Do not write a note when nothing changed. Waiting on an external gate with a date is `due:`, not a re-check note every few hours.
 
