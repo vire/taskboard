@@ -19,7 +19,55 @@ Use a group when:
 
 A group costs more tokens and more review rounds. If two workers would just wait on each other, use one.
 
-## 2. Roles
+## 2. The kickoff prompt
+
+The operator only writes a few plain lines to their coordinator session. The coordinator writes the rest: the plans, BRIEF.md and each track's opening prompt. Six lines are enough.
+
+For ACME:
+
+```text
+please, clear herdr tabs not needed, worktrees, and use /taskboard here to split work
+0. ACME-120 PR - get it approved
+1. finish the uploads-to-object-storage migration
+2. split billing out of the monolith + evidence
+Use herdr tabs for each track, opus/medium is the orchestrator, sonnet-high is the worker, fable consultant in case of dilemma, opus-high reviewer and ping me if stuck.
+I won't be around much today so I want this to run smoothly and autonomously
+```
+
+Template:
+
+```text
+Clear the Herdr tabs and worktrees we no longer need, then use /taskboard here to split the work:
+0. <PR> - get it approved
+1. Finish <initiative A>
+2. <goal B> + evidence
+One Herdr tab per track: opus/medium orchestrator, sonnet/high workers, opus/high reviewer, fable consultant only for dilemmas. Ping me in <OPERATOR_CHANNEL> if stuck.
+I won't be around much today, so run it autonomously: prepare every gate and I clear them in batches.
+```
+
+How the coordinator expands it:
+
+| Kickoff says | Coordinator produces |
+|---|---|
+| clear tabs, worktrees | Lists tabs and worktrees and removes only those it started or that are merged and clean. It leaves anything with uncommitted work and shows what it removed |
+| use /taskboard to split work | One plan per numbered item. Tasks go in merge order, each with an outcome and done-when (section 4) |
+| each numbered item | One track: a Herdr tab named after the ticket and one orchestrator with its opening prompt (section 5) |
+| the model line | The roles table (section 3), copied into BRIEF.md |
+| ping me if stuck | BRIEF "Pinging the owner": `<OPERATOR_CHANNEL>`, typed gate first, `tb gates` verbatim, at most one ping per hour per track |
+| run autonomously | BRIEF "Hard rules": nothing irreversible or prod-facing without the owner. Workers keep claiming while gates are open, and the coordinator runs the watchdog (section 8) |
+
+The resulting setup:
+
+```text
+BRIEF.md                    shared by all tracks, in <BRIEF_DIR>
+tab ACME-120  orchestrator  P-003  PR approval: reviewer pass, one worker for fixes until the checklist holds
+tab ACME-123  orchestrator  P-001 + P-002  uploads API and web: 2 workers, reviewer, consultant on demand
+tab ACME-130  orchestrator  P-004  billing split: 2 workers, reviewer
+```
+
+"Get it approved" means the checklist in BRIEF.md holds at the current head. The owner still merges.
+
+## 3. Roles
 
 | Role | Model, effort | Started by | Does | Never |
 |---|---|---|---|---|
@@ -30,7 +78,7 @@ A group costs more tokens and more review rounds. If two workers would just wait
 | Reviewer | Opus, high | orchestrator | Reads the full diff at the exact head against the task and the checklist, then posts findings on the PR | Reviews a diff it wrote |
 | Consultant | Fable | orchestrator | Answers one real dilemma (design fork, unclear evidence, conflicting rules). Closed after the one question | Stays open, writes code |
 
-## 3. Launch
+## 4. Launch
 
 Coordinator, once. Create the plan and its tasks in merge order. Each owner gate goes on the task that needs it; it is not a task of its own.
 
@@ -81,12 +129,12 @@ Orchestrator, per worker: a worktree first, then a pane in its own tab, then the
 git -C ~/code/acme worktree add ../acme-wt-<TRACK>-w1 -b uploads-dual-write origin/main
 P=$(herdr pane split --current --direction right --cwd ~/code/acme-wt-<TRACK>-w1 --no-focus | jq -r .result.pane.pane_id)
 herdr agent start <TRACK>-w1 --kind claude --pane "$P" -- --model sonnet --effort high --permission-mode auto
-herdr agent prompt <TRACK>-w1 "<worker prompt, section 6>"
+herdr agent prompt <TRACK>-w1 "<worker prompt, section 7>"
 ```
 
 The reviewer and the consultant start the same way, in a pane on the shared checkout. The reviewer uses `-- --model opus --effort high --permission-mode auto`. The consultant uses `-- --model claude-fable-5-1 --permission-mode auto` and is closed with `herdr pane close <pane-id>` after its answer.
 
-## 4. Orchestrator opening prompt
+## 5. Orchestrator opening prompt
 
 Keep it short. The brief carries the rules.
 
@@ -111,7 +159,7 @@ Steps:
 5. While gates are open, keep workers on ready tasks. Stop when only gates remain, then report.
 ```
 
-## 5. BRIEF.md template
+## 6. BRIEF.md template
 
 Save as `<BRIEF_DIR>/BRIEF.md`, outside the repo. All tracks share it.
 
@@ -177,7 +225,7 @@ Batch review fixes into one push. Every new head resets the bot, CI and the revi
 - Watchdogs print a self-test line every run. A silent watchdog is a broken one.
 ````
 
-## 6. Worker and reviewer prompts
+## 7. Worker and reviewer prompts
 
 Worker:
 
@@ -210,7 +258,7 @@ Answer with: the choice, why, and what fact would flip it.
 
 The orchestrator records the answer with `tb note TB-x "consultant: chose B because ...; would flip if ..."`.
 
-## 7. The operator's loop
+## 8. The operator's loop
 
 1. **Standup.** `tb standup` shows gates first, then what each owner did since your last standup. Ask the orchestrators for `tb standup --markdown`, posted verbatim, never summarized.
 2. **Gates.** `tb gates` is your queue, in `after:` order with each `cmd:`. Clear gates top down: merge, then the prod migration it unlocks, then the next merge. Do not skip ahead. A PR merged out of order turns main red.
@@ -231,7 +279,7 @@ The orchestrator records the answer with `tb note TB-x "consultant: chose B beca
    ```
    The orchestrator closes the panes it started. At the end, run the `retro` skill over the window and append its lessons to BRIEF.md.
 
-## 8. Pitfalls
+## 9. Pitfalls
 
 - **Ticket IDs in branch names auto-close tickets.** A ticket showed Done while the work was half merged. Keep IDs in the PR body only.
 - **State the merge order** in every PR body and as `after:` on the gates. Post `tb gates` verbatim; a hand-typed list goes stale.
